@@ -1,0 +1,57 @@
+name: Feature request
+description: Suggest an idea or enhancement for Femux
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for suggesting a feature. Help us understand the problem and desired outcome.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem to solve
+      description: What user pain point does this address?
+      placeholder: I find it difficult to...
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe your preferred solution.
+      placeholder: Add a setting that...
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Any alternative solutions or workarounds?
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Terminal runtime
+        - Tabs & panes
+        - UI/UX
+        - Settings
+        - Build/CI
+        - Documentation
+        - Other
+  - type: textarea
+    id: acceptance
+    attributes:
+      label: Acceptance criteria
+      description: How will we know this is done?
+      placeholder: |
+        - [ ] ...
+        - [ ] ...
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Pre-submit checks
+      options:
+        - label: I searched existing issues and did not find a duplicate.
+          required: true
