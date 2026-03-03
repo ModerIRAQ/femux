@@ -1633,22 +1633,6 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
               onTap: _openHelpDialog,
             ),
 
-            // New tab button (long-press for folder)
-            Tooltip(
-              message: 'New tab · Long-press to pick folder',
-              child: GestureDetector(
-                onTap: () => _addNewTab(),
-                onLongPress: () async {
-                  final dir = await FilePicker.platform.getDirectoryPath();
-                  if (dir != null) _addNewTab(workingDirectory: dir);
-                },
-                child: const Padding(
-                  padding: EdgeInsets.symmetric(horizontal: 6),
-                  child: Icon(Icons.add, color: DraculaColors.green, size: 18),
-                ),
-              ),
-            ),
-
             const SizedBox(width: 4),
 
             // Window controls
@@ -1700,15 +1684,43 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       proxyDecorator: (child, index, animation) {
         return Material(color: Colors.transparent, child: child);
       },
-      itemCount: tabs.length,
+      itemCount: tabs.length + 1,
       onReorder: (oldIndex, newIndex) {
+        if (oldIndex < 0 || oldIndex >= tabs.length) return;
         setState(() {
+          // Keep the "+" button fixed as the trailing element.
+          if (newIndex > tabs.length) {
+            newIndex = tabs.length;
+          }
           if (newIndex > oldIndex) newIndex--;
+          if (newIndex < 0) newIndex = 0;
+          if (newIndex > tabs.length - 1) newIndex = tabs.length - 1;
           final tab = tabs.removeAt(oldIndex);
           tabs.insert(newIndex, tab);
         });
       },
       itemBuilder: (context, index) {
+        if (index == tabs.length) {
+          return Container(
+            key: const ValueKey('new-tab-button'),
+            alignment: Alignment.center,
+            child: Tooltip(
+              message: 'New tab · Long-press to pick folder',
+              child: GestureDetector(
+                onTap: () => _addNewTab(),
+                onLongPress: () async {
+                  final dir = await FilePicker.platform.getDirectoryPath();
+                  if (dir != null) _addNewTab(workingDirectory: dir);
+                },
+                child: const Padding(
+                  padding: EdgeInsets.symmetric(horizontal: 8),
+                  child: Icon(Icons.add, color: DraculaColors.green, size: 18),
+                ),
+              ),
+            ),
+          );
+        }
+
         final tab = tabs[index];
         final isActive = tab.id == activeTabId;
         final isRenaming = _renamingTabId == tab.id;
