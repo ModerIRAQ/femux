@@ -10,10 +10,36 @@ import 'package:multi_split_view/multi_split_view.dart';
 import 'package:xterm/xterm.dart';
 import 'package:flutter_pty/flutter_pty.dart';
 import 'package:file_picker/file_picker.dart';
+import 'package:package_info_plus/package_info_plus.dart';
+import 'package:pub_semver/pub_semver.dart';
 import 'package:shared_preferences/shared_preferences.dart';
+import 'package:url_launcher/url_launcher.dart';
 
 const _prefDefaultShell = 'defaultShell';
 const _prefWindowMaximized = 'windowMaximized';
+const _repoOwner = 'ModerIRAQ';
+const _repoName = 'femux';
+
+class UpdateCheckResult {
+  final Version currentVersion;
+  final Version latestVersion;
+  final String latestTag;
+  final String? downloadUrl;
+  final String? releasePageUrl;
+  final String installerLabel;
+
+  const UpdateCheckResult({
+    required this.currentVersion,
+    required this.latestVersion,
+    required this.latestTag,
+    required this.downloadUrl,
+    required this.releasePageUrl,
+    required this.installerLabel,
+  });
+
+  bool get updateAvailable => latestVersion > currentVersion;
+  bool get hasInstaller => downloadUrl != null;
+}
 
 bool _isBenignTextInputPlatformException(Object error) {
   if (error is! PlatformException) {
@@ -26,6 +52,25 @@ bool _isBenignTextInputPlatformException(Object error) {
   return payload.contains('view id is null') ||
       (payload.contains('set editing state') &&
           payload.contains('no client is set'));
+}
+
+String? _installerExtensionForCurrentPlatform() {
+  if (Platform.isWindows) return '.exe';
+  if (Platform.isLinux) return '.deb';
+  if (Platform.isMacOS) return '.dmg';
+  return null;
+}
+
+String _installerLabelForCurrentPlatform() {
+  if (Platform.isWindows) return 'Windows installer (.exe)';
+  if (Platform.isLinux) return 'Linux package (.deb)';
+  if (Platform.isMacOS) return 'macOS installer (.dmg)';
+  return 'installer';
+}
+
+Version _parseReleaseVersion(String rawVersion) {
+  final normalized = rawVersion.trim().replaceFirst(RegExp(r'^[vV]'), '');
+  return Version.parse(normalized);
 }
 
 void main() async {
@@ -377,6 +422,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   final List<WorkspaceTab> tabs = [];
   String? activeTabId;
   String defaultShellPath = Platform.isWindows ? 'cmd.exe' : 'bash';
+  String _currentVersionLabel = '...';
+  Version? _currentVersion;
+  UpdateCheckResult? _lastUpdateCheck;
+  String? _lastUpdateError;
 
   // For tab rename
   String? _renamingTabId;
@@ -387,6 +436,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     super.initState();
     windowManager.addListener(this);
     _loadSettings();
+    _loadCurrentAppVersion();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _addNewTab();
     });
@@ -469,6 +519,140 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     await prefs.setBool(_prefWindowMaximized, isMaximized);
   }
 
+  Future<Version> _resolveCurrentVersion() async {
+    if (_currentVersion != null) {
+      return _currentVersion!;
+    }
+
+    final packageInfo = await PackageInfo.fromPlatform();
+    final parsed = _parseReleaseVersion(packageInfo.version);
+    if (mounted) {
+      setState(() {
+        _currentVersion = parsed;
+        _currentVersionLabel = parsed.toString();
+      });
+    } else {
+      _currentVersion = parsed;
+      _currentVersionLabel = parsed.toString();
+    }
+    return parsed;
+  }
+
+  Future<void> _loadCurrentAppVersion() async {
+    try {
+      await _resolveCurrentVersion();
+    } catch (_) {
+      if (!mounted) return;
+      setState(() {
+        _currentVersion = null;
+        _currentVersionLabel = 'unknown';
+      });
+    }
+  }
+
+  Future<UpdateCheckResult> _fetchLatestUpdateInfo() async {
+    final installerExtension = _installerExtensionForCurrentPlatform();
+    if (installerExtension == null) {
+      throw StateError(
+        'Auto-update download is not supported on ${Platform.operatingSystem}.',
+      );
+    }
+
+    final currentVersion = await _resolveCurrentVersion();
+    final client = HttpClient()
+      ..connectionTimeout = const Duration(seconds: 15);
+
+    try {
+      final request = await client.getUrl(
+        Uri.https(
+          'api.github.com',
+          '/repos/$_repoOwner/$_repoName/releases/latest',
+        ),
+      );
+      request.headers.set(
+        HttpHeaders.acceptHeader,
+        'application/vnd.github+json',
+      );
+      request.headers.set(HttpHeaders.userAgentHeader, 'Femux Update Checker');
+
+      final response = await request.close();
+      final body = await utf8.decoder.bind(response).join();
+      if (response.statusCode != HttpStatus.ok) {
+        throw StateError('GitHub API returned HTTP ${response.statusCode}.');
+      }
+
+      final payload = jsonDecode(body);
+      if (payload is! Map<String, dynamic>) {
+        throw const FormatException('Unexpected response structure.');
+      }
+
+      final tag = (payload['tag_name']?.toString() ?? '').trim();
+      if (tag.isEmpty) {
+        throw const FormatException('Latest release tag is missing.');
+      }
+
+      final latestVersion = _parseReleaseVersion(tag);
+      final releasePageUrl = payload['html_url']?.toString();
+      String? installerUrl;
+
+      final assets = payload['assets'];
+      if (assets is List) {
+        for (final item in assets) {
+          if (item is! Map) continue;
+          final name = item['name']?.toString().toLowerCase();
+          final url = item['browser_download_url']?.toString();
+          if (name == null || url == null) continue;
+          if (name.endsWith(installerExtension)) {
+            installerUrl = url;
+            break;
+          }
+        }
+      }
+
+      return UpdateCheckResult(
+        currentVersion: currentVersion,
+        latestVersion: latestVersion,
+        latestTag: tag,
+        downloadUrl: installerUrl,
+        releasePageUrl: releasePageUrl,
+        installerLabel: _installerLabelForCurrentPlatform(),
+      );
+    } on FormatException catch (error) {
+      throw StateError('Invalid release metadata: ${error.message}');
+    } finally {
+      client.close(force: true);
+    }
+  }
+
+  Future<void> _openUpdateDownload(UpdateCheckResult result) async {
+    final target = result.downloadUrl ?? result.releasePageUrl;
+    if (target == null || target.isEmpty) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No download URL found for this release.'),
+        ),
+      );
+      return;
+    }
+
+    final uri = Uri.tryParse(target);
+    if (uri == null) {
+      if (!mounted) return;
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Invalid download URL: $target')));
+      return;
+    }
+
+    final launched = await launchUrl(uri, mode: LaunchMode.externalApplication);
+    if (!launched && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text('Could not open: $target')));
+    }
+  }
+
   Future<void> _toggleWindowMaximize() async {
     FocusManager.instance.primaryFocus?.unfocus();
     await Future.delayed(const Duration(milliseconds: 50));
@@ -488,12 +672,83 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     String selected = options.contains(defaultShellPath)
         ? defaultShellPath
         : options.first;
+    UpdateCheckResult? updateResult = _lastUpdateCheck;
+    String? updateError = _lastUpdateError;
+    bool checkingUpdate = false;
+
+    Future<void> runUpdateCheck(
+      StateSetter setDialogState,
+      BuildContext dialogContext,
+    ) async {
+      setDialogState(() {
+        checkingUpdate = true;
+        updateError = null;
+      });
+
+      try {
+        final result = await _fetchLatestUpdateInfo();
+        if (!mounted || !dialogContext.mounted) return;
+        setState(() {
+          _lastUpdateCheck = result;
+          _lastUpdateError = null;
+        });
+        setDialogState(() {
+          updateResult = result;
+        });
+      } catch (error) {
+        final message = error is StateError
+            ? error.message
+            : 'Failed to check updates: $error';
+        if (!mounted || !dialogContext.mounted) return;
+        setState(() {
+          _lastUpdateCheck = null;
+          _lastUpdateError = message;
+        });
+        setDialogState(() {
+          updateResult = null;
+          updateError = message;
+        });
+      } finally {
+        if (dialogContext.mounted) {
+          setDialogState(() {
+            checkingUpdate = false;
+          });
+        }
+      }
+    }
 
     await showDialog<void>(
       context: context,
       builder: (context) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
+            final canDownloadInstaller =
+                updateResult != null &&
+                updateResult!.updateAvailable &&
+                updateResult!.hasInstaller;
+            final canOpenReleasePage =
+                updateResult != null &&
+                updateResult!.updateAvailable &&
+                !updateResult!.hasInstaller &&
+                updateResult!.releasePageUrl != null;
+
+            String? statusText;
+            Color? statusColor;
+            if (updateResult != null) {
+              if (!updateResult!.updateAvailable) {
+                statusText = 'You are on the latest version.';
+                statusColor = DraculaColors.green;
+              } else if (updateResult!.hasInstaller) {
+                statusText =
+                    'Update available: ${updateResult!.latestVersion} (${updateResult!.latestTag})';
+                statusColor = DraculaColors.yellow;
+              } else {
+                statusText =
+                    'Update found, but no ${updateResult!.installerLabel} asset is attached to the latest release.';
+                statusColor = DraculaColors.orange;
+              }
+            }
+
             return AlertDialog(
               backgroundColor: DraculaColors.currentLine,
               title: const Text(
@@ -501,43 +756,133 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                 style: TextStyle(color: DraculaColors.foreground),
               ),
               content: SizedBox(
-                width: 420,
-                child: Column(
-                  mainAxisSize: MainAxisSize.min,
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      'Default terminal (${Platform.operatingSystem})',
-                      style: const TextStyle(
-                        color: DraculaColors.comment,
-                        fontSize: 12,
+                width: 520,
+                child: SingleChildScrollView(
+                  child: Column(
+                    mainAxisSize: MainAxisSize.min,
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      Text(
+                        'Default terminal (${Platform.operatingSystem})',
+                        style: const TextStyle(
+                          color: DraculaColors.comment,
+                          fontSize: 12,
+                        ),
                       ),
-                    ),
-                    const SizedBox(height: 10),
-                    DropdownButtonFormField<String>(
-                      initialValue: selected,
-                      dropdownColor: DraculaColors.currentLine,
-                      decoration: const InputDecoration(
-                        isDense: true,
-                        border: OutlineInputBorder(),
+                      const SizedBox(height: 10),
+                      DropdownButtonFormField<String>(
+                        initialValue: selected,
+                        dropdownColor: DraculaColors.currentLine,
+                        decoration: const InputDecoration(
+                          isDense: true,
+                          border: OutlineInputBorder(),
+                        ),
+                        style: const TextStyle(color: DraculaColors.foreground),
+                        items: options
+                            .map(
+                              (shell) => DropdownMenuItem<String>(
+                                value: shell,
+                                child: Text(_shellLabel(shell)),
+                              ),
+                            )
+                            .toList(),
+                        onChanged: (value) {
+                          if (value == null) return;
+                          setDialogState(() {
+                            selected = value;
+                          });
+                        },
                       ),
-                      style: const TextStyle(color: DraculaColors.foreground),
-                      items: options
-                          .map(
-                            (shell) => DropdownMenuItem<String>(
-                              value: shell,
-                              child: Text(_shellLabel(shell)),
+                      const SizedBox(height: 18),
+                      Divider(
+                        color: DraculaColors.comment.withValues(alpha: 0.35),
+                      ),
+                      const SizedBox(height: 10),
+                      const Text(
+                        'Updates',
+                        style: TextStyle(
+                          color: DraculaColors.cyan,
+                          fontWeight: FontWeight.bold,
+                          fontSize: 13,
+                        ),
+                      ),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Current version: $_currentVersionLabel',
+                        style: const TextStyle(
+                          color: DraculaColors.foreground,
+                          fontSize: 12,
+                        ),
+                      ),
+                      if (updateResult != null) ...[
+                        const SizedBox(height: 6),
+                        Text(
+                          'Latest version: ${updateResult!.latestVersion}',
+                          style: const TextStyle(
+                            color: DraculaColors.foreground,
+                            fontSize: 12,
+                          ),
+                        ),
+                        if (statusText != null) ...[
+                          const SizedBox(height: 6),
+                          Text(
+                            statusText,
+                            style: TextStyle(
+                              color: statusColor ?? DraculaColors.comment,
+                              fontSize: 12,
                             ),
-                          )
-                          .toList(),
-                      onChanged: (value) {
-                        if (value == null) return;
-                        setDialogState(() {
-                          selected = value;
-                        });
-                      },
-                    ),
-                  ],
+                          ),
+                        ],
+                      ],
+                      if (updateError != null) ...[
+                        const SizedBox(height: 8),
+                        Text(
+                          updateError!,
+                          style: const TextStyle(
+                            color: DraculaColors.red,
+                            fontSize: 12,
+                          ),
+                        ),
+                      ],
+                      const SizedBox(height: 10),
+                      if (checkingUpdate)
+                        const Padding(
+                          padding: EdgeInsets.only(bottom: 10),
+                          child: LinearProgressIndicator(minHeight: 2),
+                        ),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          OutlinedButton.icon(
+                            onPressed: checkingUpdate
+                                ? null
+                                : () => runUpdateCheck(setDialogState, context),
+                            icon: const Icon(Icons.system_update_alt, size: 16),
+                            label: const Text('Check for updates'),
+                          ),
+                          if (canDownloadInstaller)
+                            ElevatedButton.icon(
+                              onPressed: checkingUpdate
+                                  ? null
+                                  : () => _openUpdateDownload(updateResult!),
+                              icon: const Icon(Icons.download, size: 16),
+                              label: Text(
+                                'Download ${updateResult!.installerLabel}',
+                              ),
+                            ),
+                          if (canOpenReleasePage)
+                            ElevatedButton.icon(
+                              onPressed: checkingUpdate
+                                  ? null
+                                  : () => _openUpdateDownload(updateResult!),
+                              icon: const Icon(Icons.open_in_new, size: 16),
+                              label: const Text('Open release page'),
+                            ),
+                        ],
+                      ),
+                    ],
+                  ),
                 ),
               ),
               actions: [
