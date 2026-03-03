@@ -17,6 +17,7 @@ import 'package:url_launcher/url_launcher.dart';
 
 const _prefDefaultShell = 'defaultShell';
 const _prefWindowMaximized = 'windowMaximized';
+const _prefLastNotifiedUpdateTag = 'lastNotifiedUpdateTag';
 const _repoOwner = 'ModerIRAQ';
 const _repoName = 'femux';
 
@@ -426,6 +427,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   Version? _currentVersion;
   UpdateCheckResult? _lastUpdateCheck;
   String? _lastUpdateError;
+  bool _startupUpdateCheckTriggered = false;
 
   // For tab rename
   String? _renamingTabId;
@@ -439,6 +441,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     _loadCurrentAppVersion();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _addNewTab();
+      _runStartupUpdateCheck();
     });
   }
 
@@ -650,6 +653,49 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text('Could not open: $target')));
+    }
+  }
+
+  Future<void> _runStartupUpdateCheck() async {
+    if (_startupUpdateCheckTriggered) return;
+    _startupUpdateCheckTriggered = true;
+
+    try {
+      final result = await _fetchLatestUpdateInfo();
+      if (!mounted) return;
+
+      setState(() {
+        _lastUpdateCheck = result;
+        _lastUpdateError = null;
+      });
+
+      if (!result.updateAvailable) return;
+
+      final prefs = await SharedPreferences.getInstance();
+      final lastNotifiedTag = prefs.getString(_prefLastNotifiedUpdateTag);
+      if (lastNotifiedTag == result.latestTag) return;
+      await prefs.setString(_prefLastNotifiedUpdateTag, result.latestTag);
+
+      if (!mounted) return;
+
+      final messenger = ScaffoldMessenger.of(context);
+      messenger.clearSnackBars();
+      messenger.showSnackBar(
+        SnackBar(
+          content: Text('Update ${result.latestTag} is available.'),
+          duration: const Duration(seconds: 8),
+          action: result.downloadUrl != null || result.releasePageUrl != null
+              ? SnackBarAction(
+                  label: result.downloadUrl != null ? 'Download' : 'View',
+                  onPressed: () {
+                    _openUpdateDownload(result);
+                  },
+                )
+              : null,
+        ),
+      );
+    } catch (_) {
+      // Startup check is best-effort; avoid noisy errors during launch.
     }
   }
 
