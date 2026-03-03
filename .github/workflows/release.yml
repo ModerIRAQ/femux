@@ -2,12 +2,24 @@ name: Release
 
 on:
   push:
+    branches:
+      - main
+      - master
     tags:
       - "v*"
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag to build (example: v1.0.0)"
+        required: true
+        type: string
 
 permissions:
   contents: write
+
+env:
+  RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || (startsWith(github.ref, 'refs/tags/') && github.ref_name) || format('dev-{0}', github.run_number) }}
+  CHECKOUT_REF: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.tag || github.sha }}
 
 jobs:
   build-windows:
@@ -15,6 +27,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -55,6 +69,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -94,6 +110,8 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          ref: ${{ env.CHECKOUT_REF }}
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -133,6 +151,9 @@ jobs:
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          target_commitish: ${{ github.sha }}
+          prerelease: ${{ !startsWith(github.ref, 'refs/tags/') }}
           generate_release_notes: true
           files: |
             release-artifacts/**/*.exe
