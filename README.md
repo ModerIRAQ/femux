@@ -42,6 +42,28 @@ flutter run -d windows
 
 For Linux/macOS replace the device target accordingly.
 
+## Release Automation
+
+This repository includes an automated release pipeline in
+`.github/workflows/release.yml`.
+
+### Trigger
+
+Push a version tag:
+
+```bash
+git tag v1.0.0
+git push origin v1.0.0
+```
+
+### Output
+
+- Windows installer (`.exe`) via Inno Setup
+- Linux package (`.deb`)
+- macOS installer (`.dmg`)
+
+Artifacts are attached automatically to the GitHub Release for that tag.
+
 ## Project Structure
 
 - Main app logic: `lib/main.dart`
