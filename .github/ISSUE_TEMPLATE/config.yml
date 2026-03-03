@@ -1,8 +1,8 @@
 blank_issues_enabled: false
 contact_links:
   - name: Security vulnerability report
-    url: https://github.com/<your-org-or-username>/femux/security/advisories/new
+    url: https://github.com/ModerIRAQ/femux/security/advisories/new
     about: Please report security issues privately.
   - name: Documentation / usage questions
-    url: https://github.com/<your-org-or-username>/femux/discussions
+    url: https://github.com/ModerIRAQ/femux/discussions
     about: Ask and answer questions in Discussions.
