@@ -390,23 +390,66 @@ String _shellLabel(String shellPath) {
 class WorkspaceTab {
   final String id;
   String title;
-  final List<TerminalInstance> terminals;
-  final MultiSplitViewController splitController;
+  final Map<String, TerminalInstance> panes;
+  PaneNode rootPane;
   String? focusedPaneId;
 
   WorkspaceTab({
     required this.id,
     required this.title,
-    required this.terminals,
-    required this.splitController,
+    required this.panes,
+    required this.rootPane,
     this.focusedPaneId,
   });
 
+  int get paneCount => panes.length;
+
   void dispose() {
-    for (final t in terminals) {
+    for (final t in panes.values) {
       t.dispose();
     }
   }
+}
+
+sealed class PaneNode {
+  const PaneNode();
+}
+
+class PaneLeafNode extends PaneNode {
+  final String paneId;
+
+  const PaneLeafNode(this.paneId);
+}
+
+class PaneSplitNode extends PaneNode {
+  Axis axis;
+  final List<PaneNode> children;
+  final MultiSplitViewController controller;
+
+  PaneSplitNode({
+    required this.axis,
+    required List<PaneNode> children,
+    List<Area>? areas,
+  }) : children = List<PaneNode>.from(children),
+       controller = MultiSplitViewController(
+         areas:
+             areas ??
+             List<Area>.generate(children.length, (_) => Area(flex: 1)),
+       );
+}
+
+enum DropSide { left, right, top, bottom }
+
+class _PaneLocation {
+  final PaneLeafNode leaf;
+  final PaneSplitNode? parent;
+  final int indexInParent;
+
+  const _PaneLocation({
+    required this.leaf,
+    required this.parent,
+    required this.indexInParent,
+  });
 }
 
 // --- Main UI ---
@@ -428,6 +471,8 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   UpdateCheckResult? _lastUpdateCheck;
   String? _lastUpdateError;
   bool _startupUpdateCheckTriggered = false;
+  String? _dropPreviewPaneId;
+  DropSide? _dropPreviewSide;
 
   // For tab rename
   String? _renamingTabId;
@@ -989,11 +1034,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                   const SizedBox(height: 8),
                   _helpRow('Ctrl+T', 'Open a new terminal tab'),
                   _helpRow('Ctrl+W', 'Close active tab'),
-                  _helpRow('Ctrl+D', 'Split active pane'),
-                  _helpRow(
-                    'Ctrl+Shift+D',
-                    'Split active pane and choose a folder',
-                  ),
+                  _helpRow('Ctrl+D', 'Split active pane right (side-by-side)'),
+                  _helpRow('Ctrl+Shift+D', 'Split right and choose a folder'),
+                  _helpRow('Ctrl+E', 'Split active pane down (up/down)'),
+                  _helpRow('Ctrl+Shift+E', 'Split down and choose a folder'),
                   const SizedBox(height: 14),
                   const Text(
                     'Mouse tricks',
@@ -1007,6 +1051,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                   _helpRow('Double-click tab', 'Rename tab'),
                   _helpRow('Drag tab', 'Reorder tabs'),
                   _helpRow('Long-press +', 'Open new tab in selected folder'),
+                  _helpRow(
+                    'Drag pane handle',
+                    'Drop on pane edge to place left/right/up/down',
+                  ),
                   _helpRow('Right-click pane', 'Open pane menu (split/close)'),
                   _helpRow('Close icon in pane', 'Close that pane'),
                   const SizedBox(height: 14),
@@ -1019,7 +1067,14 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                     ),
                   ),
                   const SizedBox(height: 8),
-                  _helpRow('Split button', 'Split pane quickly'),
+                  _helpRow(
+                    'Split right button',
+                    'Create a side-by-side pane quickly',
+                  ),
+                  _helpRow(
+                    'Split down button',
+                    'Create an up/down pane quickly',
+                  ),
                   _helpRow('Settings button', 'Choose default terminal for OS'),
                   _helpRow('Help button', 'Open this help window'),
                   _helpRow('Window controls', 'Minimize / maximize / close'),
@@ -1069,9 +1124,11 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     );
   }
 
-  void _addNewTab({String? workingDirectory}) {
+  TerminalInstance? _startTerminalInstance({
+    String? workingDirectory,
+    required String failureMessage,
+  }) {
     TerminalInstance? instance;
-
     final shellCandidates = _buildShellCandidates(defaultShellPath);
 
     for (final shell in shellCandidates) {
@@ -1087,27 +1144,248 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       }
     }
 
-    if (instance == null) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Unable to start a shell (pwsh/powershell/cmd).'),
-          ),
-        );
+    if (instance == null && mounted) {
+      ScaffoldMessenger.of(
+        context,
+      ).showSnackBar(SnackBar(content: Text(failureMessage)));
+    }
+    return instance;
+  }
+
+  List<String> _collectPaneIds(PaneNode node) {
+    if (node is PaneLeafNode) {
+      return [node.paneId];
+    }
+
+    final split = node as PaneSplitNode;
+    final result = <String>[];
+    for (final child in split.children) {
+      result.addAll(_collectPaneIds(child));
+    }
+    return result;
+  }
+
+  _PaneLocation? _findPaneLocation(
+    PaneNode node,
+    String paneId, {
+    PaneSplitNode? parent,
+    int indexInParent = -1,
+  }) {
+    if (node is PaneLeafNode) {
+      if (node.paneId != paneId) {
+        return null;
       }
+      return _PaneLocation(
+        leaf: node,
+        parent: parent,
+        indexInParent: indexInParent,
+      );
+    }
+
+    final split = node as PaneSplitNode;
+    for (var i = 0; i < split.children.length; i++) {
+      final found = _findPaneLocation(
+        split.children[i],
+        paneId,
+        parent: split,
+        indexInParent: i,
+      );
+      if (found != null) {
+        return found;
+      }
+    }
+    return null;
+  }
+
+  Area _copyAreaWithFallback(Area? source) {
+    if (source == null) {
+      return Area(flex: 1);
+    }
+    return Area(
+      size: source.size,
+      flex: source.size == null ? source.flex : null,
+      min: source.min,
+      max: source.max,
+    );
+  }
+
+  void _insertAreaAt(PaneSplitNode split, int index) {
+    final areas = split.controller.areas.toList(growable: true);
+    final safeIndex = index.clamp(0, areas.length).toInt();
+    areas.insert(safeIndex, Area(flex: 1));
+    split.controller.areas = areas;
+  }
+
+  void _removeAreaAt(PaneSplitNode split, int index) {
+    final areas = split.controller.areas.toList(growable: true);
+    if (index >= 0 && index < areas.length) {
+      areas.removeAt(index);
+    }
+    if (areas.isEmpty) {
+      areas.add(Area(flex: 1));
+    }
+    split.controller.areas = areas;
+  }
+
+  void _syncSplitTree(PaneNode node) {
+    if (node is! PaneSplitNode) {
       return;
     }
 
-    final controller = MultiSplitViewController();
-    controller.areas = [Area(flex: 1, data: instance.id)];
+    final current = node.controller.areas.toList(growable: false);
+    if (current.length != node.children.length) {
+      final synced = <Area>[];
+      for (var i = 0; i < node.children.length; i++) {
+        synced.add(
+          _copyAreaWithFallback(i < current.length ? current[i] : null),
+        );
+      }
+      node.controller.areas = synced;
+    }
 
+    for (final child in node.children) {
+      _syncSplitTree(child);
+    }
+  }
+
+  PaneNode _normalizePaneTree(PaneNode node) {
+    if (node is! PaneSplitNode) {
+      return node;
+    }
+
+    for (var i = 0; i < node.children.length; i++) {
+      node.children[i] = _normalizePaneTree(node.children[i]);
+    }
+
+    if (node.children.length == 1) {
+      return node.children.first;
+    }
+
+    _syncSplitTree(node);
+    return node;
+  }
+
+  void _replacePaneNode(WorkspaceTab tab, String paneId, PaneNode replacement) {
+    final location = _findPaneLocation(tab.rootPane, paneId);
+    if (location == null) {
+      return;
+    }
+
+    if (location.parent == null) {
+      tab.rootPane = replacement;
+    } else {
+      location.parent!.children[location.indexInParent] = replacement;
+      _syncSplitTree(location.parent!);
+    }
+  }
+
+  PaneLeafNode? _detachPane(WorkspaceTab tab, String paneId) {
+    final location = _findPaneLocation(tab.rootPane, paneId);
+    if (location == null || location.parent == null) {
+      return null;
+    }
+
+    location.parent!.children.removeAt(location.indexInParent);
+    _removeAreaAt(location.parent!, location.indexInParent);
+    tab.rootPane = _normalizePaneTree(tab.rootPane);
+    return location.leaf;
+  }
+
+  void _insertLeafRelativeToTarget(
+    WorkspaceTab tab, {
+    required PaneLeafNode leafToInsert,
+    required String targetPaneId,
+    required DropSide side,
+  }) {
+    final targetLocation = _findPaneLocation(tab.rootPane, targetPaneId);
+    if (targetLocation == null) {
+      tab.rootPane = PaneSplitNode(
+        axis: Axis.horizontal,
+        children: [tab.rootPane, leafToInsert],
+      );
+      tab.rootPane = _normalizePaneTree(tab.rootPane);
+      return;
+    }
+
+    final axis = side == DropSide.left || side == DropSide.right
+        ? Axis.horizontal
+        : Axis.vertical;
+    final insertAfter = side == DropSide.right || side == DropSide.bottom;
+
+    final parent = targetLocation.parent;
+    if (parent != null && parent.axis == axis) {
+      final insertIndex = targetLocation.indexInParent + (insertAfter ? 1 : 0);
+      parent.children.insert(insertIndex, leafToInsert);
+      _insertAreaAt(parent, insertIndex);
+      tab.rootPane = _normalizePaneTree(tab.rootPane);
+      return;
+    }
+
+    final replacement = PaneSplitNode(
+      axis: axis,
+      children: insertAfter
+          ? [targetLocation.leaf, leafToInsert]
+          : [leafToInsert, targetLocation.leaf],
+    );
+    _replacePaneNode(tab, targetPaneId, replacement);
+    tab.rootPane = _normalizePaneTree(tab.rootPane);
+  }
+
+  void _movePaneByDrop(
+    WorkspaceTab tab, {
+    required String draggedPaneId,
+    required String targetPaneId,
+    required DropSide side,
+  }) {
+    if (draggedPaneId == targetPaneId) {
+      return;
+    }
+
+    final movingLeaf = _detachPane(tab, draggedPaneId);
+    if (movingLeaf == null) {
+      return;
+    }
+
+    if (_findPaneLocation(tab.rootPane, targetPaneId) == null) {
+      final firstPaneId = _collectPaneIds(tab.rootPane).firstOrNull;
+      if (firstPaneId != null) {
+        _insertLeafRelativeToTarget(
+          tab,
+          leafToInsert: movingLeaf,
+          targetPaneId: firstPaneId,
+          side: DropSide.right,
+        );
+      }
+    } else {
+      _insertLeafRelativeToTarget(
+        tab,
+        leafToInsert: movingLeaf,
+        targetPaneId: targetPaneId,
+        side: side,
+      );
+    }
+
+    tab.focusedPaneId = draggedPaneId;
+    setState(() {});
+  }
+
+  void _addNewTab({String? workingDirectory}) {
+    final instance = _startTerminalInstance(
+      workingDirectory: workingDirectory,
+      failureMessage: 'Unable to start a shell (pwsh/powershell/cmd).',
+    );
+    if (instance == null) {
+      return;
+    }
+
+    final root = PaneLeafNode(instance.id);
     final newTab = WorkspaceTab(
       id: UniqueKey().toString(),
       title: workingDirectory != null
           ? workingDirectory.split(Platform.pathSeparator).last
           : 'Terminal',
-      terminals: [instance],
-      splitController: controller,
+      panes: {instance.id: instance},
+      rootPane: root,
       focusedPaneId: instance.id,
     );
 
@@ -1117,81 +1395,57 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     });
   }
 
-  void _splitPane(WorkspaceTab tab, {String? workingDirectory}) {
-    TerminalInstance? instance;
-    final shellCandidates = _buildShellCandidates(defaultShellPath);
-
-    for (final shell in shellCandidates) {
-      try {
-        instance = TerminalInstance.spawn(
-          shell,
-          workingDirectory: workingDirectory,
-        );
-        defaultShellPath = shell;
-        break;
-      } catch (_) {
-        continue;
-      }
-    }
-
+  void _splitPane(
+    WorkspaceTab tab, {
+    String? workingDirectory,
+    DropSide side = DropSide.right,
+    String? targetPaneId,
+  }) {
+    final instance = _startTerminalInstance(
+      workingDirectory: workingDirectory,
+      failureMessage: 'Unable to split pane: no shell could be started.',
+    );
     if (instance == null) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Unable to split pane: no shell could be started.'),
-          ),
-        );
-      }
       return;
     }
 
-    tab.terminals.add(instance);
-    tab.splitController.addArea(Area(flex: 1, data: instance.id));
-    tab.focusedPaneId = instance.id;
+    final targetId =
+        targetPaneId ??
+        tab.focusedPaneId ??
+        _collectPaneIds(tab.rootPane).firstOrNull;
+    if (targetId == null) {
+      instance.dispose();
+      return;
+    }
 
+    tab.panes[instance.id] = instance;
+    _insertLeafRelativeToTarget(
+      tab,
+      leafToInsert: PaneLeafNode(instance.id),
+      targetPaneId: targetId,
+      side: side,
+    );
+    tab.focusedPaneId = instance.id;
     setState(() {});
   }
 
-  void _closePane(WorkspaceTab tab, int paneIndex) {
-    if (tab.terminals.length <= 1) {
-      // Last pane — close entire tab
+  void _closePane(WorkspaceTab tab, String paneId) {
+    if (tab.paneCount <= 1) {
       _closeTab(tab);
       return;
     }
 
-    final instance = tab.terminals[paneIndex];
-    instance.dispose();
-    tab.terminals.removeAt(paneIndex);
-    tab.splitController.removeAreaAt(paneIndex);
-
-    if (tab.focusedPaneId == instance.id && tab.terminals.isNotEmpty) {
-      tab.focusedPaneId = tab.terminals.first.id;
-    }
-
-    setState(() {});
-  }
-
-  void _reorderPanes(WorkspaceTab tab, int fromIndex, int toIndex) {
-    if (fromIndex == toIndex) return;
-    if (fromIndex < 0 || toIndex < 0) return;
-    if (fromIndex >= tab.terminals.length || toIndex >= tab.terminals.length) {
+    final removed = _detachPane(tab, paneId);
+    if (removed == null) {
       return;
     }
 
-    var targetIndex = toIndex;
-    if (fromIndex < toIndex) {
-      targetIndex -= 1;
+    final instance = tab.panes.remove(paneId);
+    instance?.dispose();
+
+    if (tab.focusedPaneId == paneId) {
+      tab.focusedPaneId = _collectPaneIds(tab.rootPane).firstOrNull;
     }
-
-    final movedTerminal = tab.terminals.removeAt(fromIndex);
-    tab.terminals.insert(targetIndex, movedTerminal);
-
-    final reorderedAreas = tab.splitController.areas.toList(growable: true);
-    final movedArea = reorderedAreas.removeAt(fromIndex);
-    reorderedAreas.insert(targetIndex, movedArea);
-    tab.splitController.areas = reorderedAreas;
-
-    tab.focusedPaneId = movedTerminal.id;
     setState(() {});
   }
 
@@ -1205,10 +1459,19 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     });
   }
 
-  Future<void> _pickFolderForPane(WorkspaceTab tab) async {
+  Future<void> _pickFolderForPane(
+    WorkspaceTab tab, {
+    DropSide side = DropSide.right,
+    String? targetPaneId,
+  }) async {
     final dir = await FilePicker.platform.getDirectoryPath();
     if (dir != null) {
-      _splitPane(tab, workingDirectory: dir);
+      _splitPane(
+        tab,
+        workingDirectory: dir,
+        side: side,
+        targetPaneId: targetPaneId,
+      );
     }
   }
 
@@ -1255,17 +1518,31 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       return KeyEventResult.handled;
     }
 
-    // Ctrl+D → split pane horizontally
+    // Ctrl+D → split pane right (side-by-side)
     if (ctrl && !shift && key == LogicalKeyboardKey.keyD) {
       final tab = _activeTab;
-      if (tab != null) _splitPane(tab);
+      if (tab != null) _splitPane(tab, side: DropSide.right);
       return KeyEventResult.handled;
     }
 
-    // Ctrl+Shift+D → split with folder picker
+    // Ctrl+Shift+D → split right with folder picker
     if (ctrl && shift && key == LogicalKeyboardKey.keyD) {
       final tab = _activeTab;
-      if (tab != null) _pickFolderForPane(tab);
+      if (tab != null) _pickFolderForPane(tab, side: DropSide.right);
+      return KeyEventResult.handled;
+    }
+
+    // Ctrl+E → split pane down (up/down)
+    if (ctrl && !shift && key == LogicalKeyboardKey.keyE) {
+      final tab = _activeTab;
+      if (tab != null) _splitPane(tab, side: DropSide.bottom);
+      return KeyEventResult.handled;
+    }
+
+    // Ctrl+Shift+E → split down with folder picker
+    if (ctrl && shift && key == LogicalKeyboardKey.keyE) {
+      final tab = _activeTab;
+      if (tab != null) _pickFolderForPane(tab, side: DropSide.bottom);
       return KeyEventResult.handled;
     }
 
@@ -1321,14 +1598,27 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             // Tabs (reorderable)
             Expanded(child: _buildTabBar()),
 
-            // Split pane button
+            // Split right (side-by-side)
             _titleBarIconButton(
               icon: Icons.vertical_split,
-              tooltip: 'Split pane (Ctrl+D) · Split in folder (Ctrl+Shift+D)',
+              tooltip:
+                  'Split right (Ctrl+D) · Split right in folder (Ctrl+Shift+D)',
               color: DraculaColors.orange,
               onTap: () {
                 final tab = _activeTab;
-                if (tab != null) _splitPane(tab);
+                if (tab != null) _splitPane(tab, side: DropSide.right);
+              },
+            ),
+
+            // Split down (up/down)
+            _titleBarIconButton(
+              icon: Icons.view_agenda,
+              tooltip:
+                  'Split down (Ctrl+E) · Split down in folder (Ctrl+Shift+E)',
+              color: DraculaColors.cyan,
+              onTap: () {
+                final tab = _activeTab;
+                if (tab != null) _splitPane(tab, side: DropSide.bottom);
               },
             ),
 
@@ -1481,7 +1771,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                     ),
                   const SizedBox(width: 8),
                   // Pane count badge
-                  if (tab.terminals.length > 1)
+                  if (tab.paneCount > 1)
                     Container(
                       padding: const EdgeInsets.symmetric(
                         horizontal: 5,
@@ -1492,7 +1782,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                         borderRadius: BorderRadius.circular(8),
                       ),
                       child: Text(
-                        '${tab.terminals.length}',
+                        '${tab.paneCount}',
                         style: const TextStyle(
                           color: DraculaColors.comment,
                           fontSize: 10,
@@ -1552,176 +1842,282 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
 
   // --- Terminal split view area ---
   Widget _buildTerminalArea(WorkspaceTab tab) {
+    _syncSplitTree(tab.rootPane);
+    final paneOrderIds = _collectPaneIds(tab.rootPane);
+    final paneOrder = <String, int>{
+      for (var i = 0; i < paneOrderIds.length; i++) paneOrderIds[i]: i + 1,
+    };
+
     return MultiSplitViewTheme(
       data: MultiSplitViewThemeData(
         dividerThickness: 1,
         dividerHandleBuffer: 0,
       ),
-      child: MultiSplitView(
-        key: ValueKey('split_${tab.id}'),
-        axis: Axis.horizontal,
-        controller: tab.splitController,
-        builder: (context, area) {
-          final paneIndex = area.index;
-          if (paneIndex >= tab.terminals.length) {
-            return const SizedBox.shrink();
-          }
-          final instance = tab.terminals[paneIndex];
-          final isFocused = tab.focusedPaneId == instance.id;
+      child: _buildPaneNode(tab, tab.rootPane, paneOrder),
+    );
+  }
 
-          return GestureDetector(
-            onTap: () {
-              setState(() {
-                tab.focusedPaneId = instance.id;
-              });
-            },
-            // Right-click context menu
-            onSecondaryTapUp: (details) {
-              _showPaneContextMenu(
-                context,
-                details.globalPosition,
-                tab,
-                paneIndex,
-              );
-            },
-            child: Container(
-              clipBehavior: Clip.hardEdge,
-              decoration: BoxDecoration(
-                border: Border.all(
-                  color: isFocused
-                      ? DraculaColors.purple.withValues(alpha: 0.6)
-                      : DraculaColors.currentLine.withValues(alpha: 0.3),
-                  width: isFocused ? 1.5 : 1,
-                ),
+  Widget _buildPaneNode(
+    WorkspaceTab tab,
+    PaneNode node,
+    Map<String, int> paneOrder,
+  ) {
+    if (node is PaneLeafNode) {
+      final instance = tab.panes[node.paneId];
+      if (instance == null) {
+        return const SizedBox.shrink();
+      }
+      return _buildPaneLeaf(tab, instance, paneOrder[node.paneId] ?? 1);
+    }
+
+    final split = node as PaneSplitNode;
+    _syncSplitTree(split);
+    return MultiSplitView(
+      axis: split.axis,
+      controller: split.controller,
+      builder: (context, area) {
+        if (area.index >= split.children.length) {
+          return const SizedBox.shrink();
+        }
+        return _buildPaneNode(tab, split.children[area.index], paneOrder);
+      },
+    );
+  }
+
+  DropSide _resolveDropSide(BuildContext context, Offset globalOffset) {
+    final renderBox = context.findRenderObject();
+    if (renderBox is! RenderBox) {
+      return DropSide.right;
+    }
+
+    final local = renderBox.globalToLocal(globalOffset);
+    final size = renderBox.size;
+    final dx = local.dx - (size.width / 2);
+    final dy = local.dy - (size.height / 2);
+
+    if (dx.abs() > dy.abs()) {
+      return dx < 0 ? DropSide.left : DropSide.right;
+    }
+    return dy < 0 ? DropSide.top : DropSide.bottom;
+  }
+
+  Widget _buildDropSideOverlay(DropSide side) {
+    const thickness = 4.0;
+    final color = DraculaColors.cyan.withValues(alpha: 0.9);
+
+    switch (side) {
+      case DropSide.left:
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: Container(width: thickness, color: color),
+        );
+      case DropSide.right:
+        return Align(
+          alignment: Alignment.centerRight,
+          child: Container(width: thickness, color: color),
+        );
+      case DropSide.top:
+        return Align(
+          alignment: Alignment.topCenter,
+          child: Container(height: thickness, color: color),
+        );
+      case DropSide.bottom:
+        return Align(
+          alignment: Alignment.bottomCenter,
+          child: Container(height: thickness, color: color),
+        );
+    }
+  }
+
+  Widget _buildPaneLeaf(
+    WorkspaceTab tab,
+    TerminalInstance instance,
+    int paneNo,
+  ) {
+    final paneId = instance.id;
+    final isFocused = tab.focusedPaneId == paneId;
+
+    return GestureDetector(
+      onTap: () {
+        setState(() {
+          tab.focusedPaneId = paneId;
+        });
+      },
+      onSecondaryTapUp: (details) {
+        _showPaneContextMenu(context, details.globalPosition, tab, paneId);
+      },
+      child: DragTarget<String>(
+        onWillAcceptWithDetails: (details) => details.data != paneId,
+        onMove: (details) {
+          final side = _resolveDropSide(context, details.offset);
+          if (_dropPreviewPaneId == paneId && _dropPreviewSide == side) {
+            return;
+          }
+          setState(() {
+            _dropPreviewPaneId = paneId;
+            _dropPreviewSide = side;
+          });
+        },
+        onLeave: (_) {
+          if (_dropPreviewPaneId != paneId) {
+            return;
+          }
+          setState(() {
+            _dropPreviewPaneId = null;
+            _dropPreviewSide = null;
+          });
+        },
+        onAcceptWithDetails: (details) {
+          final side = _resolveDropSide(context, details.offset);
+          setState(() {
+            _dropPreviewPaneId = null;
+            _dropPreviewSide = null;
+          });
+          _movePaneByDrop(
+            tab,
+            draggedPaneId: details.data,
+            targetPaneId: paneId,
+            side: side,
+          );
+        },
+        builder: (context, candidateData, rejectedData) {
+          final hasCandidate = candidateData.isNotEmpty;
+          final showPreview =
+              _dropPreviewPaneId == paneId && _dropPreviewSide != null;
+
+          return Container(
+            clipBehavior: Clip.hardEdge,
+            decoration: BoxDecoration(
+              border: Border.all(
+                color: isFocused
+                    ? DraculaColors.purple.withValues(alpha: 0.6)
+                    : DraculaColors.currentLine.withValues(alpha: 0.3),
+                width: isFocused ? 1.5 : 1,
               ),
-              child: Stack(
-                children: [
-                  Positioned.fill(
-                    top: 28,
-                    child: Container(
-                      color: DraculaColors.background,
-                      child: ClipRect(
-                        child: Padding(
-                          padding: const EdgeInsets.only(top: 1),
-                          child: RepaintBoundary(
-                            child: TerminalView(
-                              key: ValueKey(instance.id),
-                              instance.terminal,
-                              backgroundOpacity: 0.0,
-                              theme: terminalTheme,
-                              hardwareKeyboardOnly:
-                                  Platform.isWindows ||
-                                  Platform.isLinux ||
-                                  Platform.isMacOS,
-                            ),
+            ),
+            child: Stack(
+              children: [
+                Positioned.fill(
+                  top: 28,
+                  child: Container(
+                    color: DraculaColors.background,
+                    child: ClipRect(
+                      child: Padding(
+                        padding: const EdgeInsets.only(top: 1),
+                        child: RepaintBoundary(
+                          child: TerminalView(
+                            key: ValueKey(instance.id),
+                            instance.terminal,
+                            backgroundOpacity: 0.0,
+                            theme: terminalTheme,
+                            hardwareKeyboardOnly:
+                                Platform.isWindows ||
+                                Platform.isLinux ||
+                                Platform.isMacOS,
                           ),
                         ),
                       ),
                     ),
                   ),
-                  DragTarget<int>(
-                    onWillAcceptWithDetails: (details) {
-                      return details.data != paneIndex;
-                    },
-                    onAcceptWithDetails: (details) {
-                      _reorderPanes(tab, details.data, paneIndex);
-                    },
-                    builder: (context, candidateData, rejectedData) {
-                      final isDropTarget = candidateData.isNotEmpty;
-                      return Container(
-                        height: 28,
-                        padding: const EdgeInsets.symmetric(horizontal: 6),
-                        decoration: BoxDecoration(
-                          color: isDropTarget
-                              ? DraculaColors.purple.withValues(alpha: 0.25)
-                              : DraculaColors.currentLine,
-                          border: Border(
-                            bottom: BorderSide(
-                              color: DraculaColors.currentLine.withValues(
-                                alpha: 0.5,
+                ),
+                Container(
+                  height: 28,
+                  padding: const EdgeInsets.symmetric(horizontal: 6),
+                  decoration: BoxDecoration(
+                    color: hasCandidate
+                        ? DraculaColors.purple.withValues(alpha: 0.25)
+                        : DraculaColors.currentLine,
+                    border: Border(
+                      bottom: BorderSide(
+                        color: DraculaColors.currentLine.withValues(alpha: 0.5),
+                      ),
+                    ),
+                  ),
+                  child: Row(
+                    children: [
+                      Draggable<String>(
+                        data: paneId,
+                        dragAnchorStrategy: childDragAnchorStrategy,
+                        maxSimultaneousDrags: 1,
+                        onDragEnd: (_) {
+                          if (_dropPreviewPaneId == null &&
+                              _dropPreviewSide == null) {
+                            return;
+                          }
+                          setState(() {
+                            _dropPreviewPaneId = null;
+                            _dropPreviewSide = null;
+                          });
+                        },
+                        feedback: Material(
+                          color: Colors.transparent,
+                          child: Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 4,
+                            ),
+                            decoration: BoxDecoration(
+                              color: DraculaColors.currentLine,
+                              border: Border.all(color: DraculaColors.purple),
+                              borderRadius: BorderRadius.circular(4),
+                            ),
+                            child: Text(
+                              'Pane $paneNo',
+                              style: const TextStyle(
+                                color: DraculaColors.foreground,
+                                fontSize: 11,
                               ),
                             ),
                           ),
                         ),
-                        child: Row(
-                          children: [
-                            Draggable<int>(
-                              data: paneIndex,
-                              dragAnchorStrategy: childDragAnchorStrategy,
-                              maxSimultaneousDrags: 1,
-                              feedback: Material(
-                                color: Colors.transparent,
-                                child: Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 8,
-                                    vertical: 4,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: DraculaColors.currentLine,
-                                    border: Border.all(
-                                      color: DraculaColors.purple,
-                                    ),
-                                    borderRadius: BorderRadius.circular(4),
-                                  ),
-                                  child: Text(
-                                    'Pane ${paneIndex + 1}',
-                                    style: const TextStyle(
-                                      color: DraculaColors.foreground,
-                                      fontSize: 11,
-                                    ),
-                                  ),
-                                ),
-                              ),
-                              childWhenDragging: const Padding(
-                                padding: EdgeInsets.symmetric(horizontal: 4),
-                                child: Icon(
-                                  Icons.drag_indicator,
-                                  size: 14,
-                                  color: DraculaColors.purple,
-                                ),
-                              ),
-                              child: const Padding(
-                                padding: EdgeInsets.symmetric(horizontal: 4),
-                                child: Icon(
-                                  Icons.drag_indicator,
-                                  size: 14,
-                                  color: DraculaColors.comment,
-                                ),
-                              ),
-                            ),
-                            Expanded(
-                              child: Text(
-                                'Pane ${paneIndex + 1}',
-                                style: TextStyle(
-                                  color: isFocused
-                                      ? DraculaColors.foreground
-                                      : DraculaColors.comment,
-                                  fontSize: 11,
-                                  fontWeight: isFocused
-                                      ? FontWeight.w600
-                                      : FontWeight.w400,
-                                ),
-                              ),
-                            ),
-                            InkWell(
-                              onTap: () => _closePane(tab, paneIndex),
-                              borderRadius: BorderRadius.circular(4),
-                              child: const Padding(
-                                padding: EdgeInsets.all(3),
-                                child: Icon(
-                                  Icons.close,
-                                  size: 12,
-                                  color: DraculaColors.comment,
-                                ),
-                              ),
-                            ),
-                          ],
+                        childWhenDragging: const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 4),
+                          child: Icon(
+                            Icons.drag_indicator,
+                            size: 14,
+                            color: DraculaColors.purple,
+                          ),
                         ),
-                      );
-                    },
+                        child: const Padding(
+                          padding: EdgeInsets.symmetric(horizontal: 4),
+                          child: Icon(
+                            Icons.drag_indicator,
+                            size: 14,
+                            color: DraculaColors.comment,
+                          ),
+                        ),
+                      ),
+                      Expanded(
+                        child: Text(
+                          'Pane $paneNo',
+                          style: TextStyle(
+                            color: isFocused
+                                ? DraculaColors.foreground
+                                : DraculaColors.comment,
+                            fontSize: 11,
+                            fontWeight: isFocused
+                                ? FontWeight.w600
+                                : FontWeight.w400,
+                          ),
+                        ),
+                      ),
+                      InkWell(
+                        onTap: () => _closePane(tab, paneId),
+                        borderRadius: BorderRadius.circular(4),
+                        child: const Padding(
+                          padding: EdgeInsets.all(3),
+                          child: Icon(
+                            Icons.close,
+                            size: 12,
+                            color: DraculaColors.comment,
+                          ),
+                        ),
+                      ),
+                    ],
                   ),
-                ],
-              ),
+                ),
+                if (showPreview) _buildDropSideOverlay(_dropPreviewSide!),
+              ],
             ),
           );
         },
@@ -1734,7 +2130,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     BuildContext context,
     Offset position,
     WorkspaceTab tab,
-    int paneIndex,
+    String paneId,
   ) {
     showMenu<String>(
       context: context,
@@ -1747,13 +2143,13 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       color: DraculaColors.currentLine,
       items: [
         const PopupMenuItem(
-          value: 'split',
+          value: 'split_right',
           child: Row(
             children: [
               Icon(Icons.vertical_split, size: 16, color: DraculaColors.orange),
               SizedBox(width: 8),
               Text(
-                'Split pane',
+                'Split right',
                 style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
               ),
               Spacer(),
@@ -1765,13 +2161,39 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
           ),
         ),
         const PopupMenuItem(
-          value: 'split_folder',
+          value: 'split_left',
+          child: Row(
+            children: [
+              Icon(Icons.vertical_split, size: 16, color: DraculaColors.orange),
+              SizedBox(width: 8),
+              Text(
+                'Split left',
+                style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'split_left_folder',
           child: Row(
             children: [
               Icon(Icons.folder_open, size: 16, color: DraculaColors.yellow),
               SizedBox(width: 8),
               Text(
-                'Split in folder…',
+                'Split left in folder…',
+                style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'split_right_folder',
+          child: Row(
+            children: [
+              Icon(Icons.folder_open, size: 16, color: DraculaColors.yellow),
+              SizedBox(width: 8),
+              Text(
+                'Split right in folder…',
                 style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
               ),
               Spacer(),
@@ -1782,7 +2204,69 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             ],
           ),
         ),
-        if (tab.terminals.length > 1)
+        const PopupMenuItem(
+          value: 'split_down',
+          child: Row(
+            children: [
+              Icon(Icons.view_agenda, size: 16, color: DraculaColors.cyan),
+              SizedBox(width: 8),
+              Text(
+                'Split down',
+                style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
+              ),
+              Spacer(),
+              Text(
+                'Ctrl+E',
+                style: TextStyle(color: DraculaColors.comment, fontSize: 11),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'split_up',
+          child: Row(
+            children: [
+              Icon(Icons.view_agenda, size: 16, color: DraculaColors.cyan),
+              SizedBox(width: 8),
+              Text(
+                'Split up',
+                style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'split_up_folder',
+          child: Row(
+            children: [
+              Icon(Icons.folder_open, size: 16, color: DraculaColors.cyan),
+              SizedBox(width: 8),
+              Text(
+                'Split up in folder…',
+                style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
+              ),
+            ],
+          ),
+        ),
+        const PopupMenuItem(
+          value: 'split_down_folder',
+          child: Row(
+            children: [
+              Icon(Icons.folder_open, size: 16, color: DraculaColors.cyan),
+              SizedBox(width: 8),
+              Text(
+                'Split down in folder…',
+                style: TextStyle(color: DraculaColors.foreground, fontSize: 13),
+              ),
+              Spacer(),
+              Text(
+                'Ctrl+Shift+E',
+                style: TextStyle(color: DraculaColors.comment, fontSize: 11),
+              ),
+            ],
+          ),
+        ),
+        if (tab.paneCount > 1)
           const PopupMenuItem(
             value: 'close',
             child: Row(
@@ -1801,12 +2285,24 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
           ),
       ],
     ).then((value) {
-      if (value == 'split') {
-        _splitPane(tab);
-      } else if (value == 'split_folder') {
-        _pickFolderForPane(tab);
+      if (value == 'split_right') {
+        _splitPane(tab, side: DropSide.right, targetPaneId: paneId);
+      } else if (value == 'split_left') {
+        _splitPane(tab, side: DropSide.left, targetPaneId: paneId);
+      } else if (value == 'split_left_folder') {
+        _pickFolderForPane(tab, side: DropSide.left, targetPaneId: paneId);
+      } else if (value == 'split_right_folder') {
+        _pickFolderForPane(tab, side: DropSide.right, targetPaneId: paneId);
+      } else if (value == 'split_down') {
+        _splitPane(tab, side: DropSide.bottom, targetPaneId: paneId);
+      } else if (value == 'split_up') {
+        _splitPane(tab, side: DropSide.top, targetPaneId: paneId);
+      } else if (value == 'split_up_folder') {
+        _pickFolderForPane(tab, side: DropSide.top, targetPaneId: paneId);
+      } else if (value == 'split_down_folder') {
+        _pickFolderForPane(tab, side: DropSide.bottom, targetPaneId: paneId);
       } else if (value == 'close') {
-        _closePane(tab, paneIndex);
+        _closePane(tab, paneId);
       }
     });
   }
