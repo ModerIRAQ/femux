@@ -2194,18 +2194,24 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     final paneId = instance.id;
     final isFocused = tab.focusedPaneId == paneId;
 
-    return GestureDetector(
-      onTap: () {
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (_) {
+        if (tab.focusedPaneId == paneId) {
+          return;
+        }
         setState(() {
           tab.focusedPaneId = paneId;
         });
       },
-      onSecondaryTapDown: (details) {
-        unawaited(
-          _showPaneContextMenu(context, details.globalPosition, tab, paneId),
-        );
-      },
-      child: DragTarget<String>(
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onSecondaryTapDown: (details) {
+          unawaited(
+            _showPaneContextMenu(context, details.globalPosition, tab, paneId),
+          );
+        },
+        child: DragTarget<String>(
         onWillAcceptWithDetails: (details) => details.data != paneId,
         onMove: (details) {
           final side = _resolveDropSide(context, details.offset);
@@ -2380,6 +2386,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             ),
           );
         },
+        ),
       ),
     );
   }
