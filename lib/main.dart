@@ -196,7 +196,7 @@ class TerminalInstance {
   factory TerminalInstance.spawn(String shellPath, {String? workingDirectory}) {
     final executable = _shellExecutable(shellPath);
     final shellArgs = _shellArguments(shellPath);
-    final shellEnvironment = _shellEnvironment(shellPath);
+    final shellEnvironment = _shellEnvironment();
 
     final pty = Pty.start(
       executable,
@@ -282,50 +282,28 @@ List<String> _shellArguments(String shellPath) {
   return [];
 }
 
-Map<String, String>? _shellEnvironment(String shellPath) {
+Map<String, String>? _shellEnvironment() {
   if (!Platform.isWindows) {
     return null;
   }
 
-  final env = Platform.environment;
-  final result = <String, String>{};
-
-  const keys = [
-    'PATH',
-    'USERPROFILE',
-    'HOMEDRIVE',
-    'HOMEPATH',
-    'HOME',
-    'APPDATA',
-    'LOCALAPPDATA',
-    'TEMP',
-    'TMP',
-    'SystemRoot',
-    'WINDIR',
-    'COMSPEC',
-    'PATHEXT',
-    'PSModulePath',
-    'ProgramFiles',
-    'ProgramFiles(x86)',
-    'ProgramW6432',
-    'PUBLIC',
-    'USERNAME',
-    'USERDOMAIN',
-  ];
-
-  for (final key in keys) {
-    final value = env[key];
-    if (value != null && value.isNotEmpty) {
-      result[key] = value;
-    }
-  }
+  // Keep the full inherited environment so tools such as ssh can access
+  // auth-agent/proxy variables that may not exist in a small allow-list.
+  final result = Map<String, String>.from(Platform.environment);
 
   // PowerShell relies on a valid user home when initializing FileSystem drives.
-  result['HOME'] = result['HOME'] ?? result['USERPROFILE'] ?? '';
-
-  // Do not pass an empty HOME.
-  if (result['HOME']!.isEmpty) {
+  final home = result['HOME']?.trim() ?? '';
+  final userProfile = result['USERPROFILE']?.trim() ?? '';
+  if (home.isEmpty && userProfile.isNotEmpty) {
+    result['HOME'] = userProfile;
+  } else if (home.isEmpty) {
     result.remove('HOME');
+  }
+
+  // Ensure interactive CLI apps (including ssh remote shells) receive a usable TERM.
+  final term = result['TERM']?.trim() ?? '';
+  if (term.isEmpty) {
+    result['TERM'] = 'xterm-256color';
   }
 
   return result;
