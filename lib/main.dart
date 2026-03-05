@@ -519,6 +519,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   String? _dropPreviewPaneId;
   DropSide? _dropPreviewSide;
   final Set<String> _failedShellLaunches = <String>{};
+  Future<void> _terminalMutationQueue = Future<void>.value();
+  int _pendingUserTerminalSpawns = 0;
+  TerminalInstance? _warmTerminal;
+  bool _warmingTerminal = false;
 
   // For tab rename
   String? _renamingTabId;
@@ -531,7 +535,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     _loadSettings();
     _loadCurrentAppVersion();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _addNewTab();
+      unawaited(_addNewTab());
       // Keep startup path focused on terminal responsiveness.
       Future<void>.delayed(const Duration(seconds: 6), _runStartupUpdateCheck);
     });
@@ -542,6 +546,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     windowManager.removeListener(this);
     _keyboardFocusNode.dispose();
     _renameController.dispose();
+    _disposeWarmTerminal();
     for (final tab in tabs) {
       tab.dispose();
     }
@@ -587,6 +592,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     if (!options.contains(resolved)) {
       resolved = fallback;
     }
+    final shellChanged = resolved != defaultShellPath;
 
     if (savedShell != null && savedShell.isNotEmpty) {
       setState(() {
@@ -598,15 +604,27 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
         defaultShellPath = resolved;
       });
     }
+
+    if (shellChanged) {
+      _failedShellLaunches.clear();
+      _disposeWarmTerminal();
+      _ensureWarmTerminal();
+    }
   }
 
   Future<void> _saveDefaultShell(String shell) async {
+    final shellChanged = shell != defaultShellPath;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefDefaultShell, shell);
     if (!mounted) return;
     setState(() {
       defaultShellPath = shell;
     });
+    if (shellChanged) {
+      _failedShellLaunches.clear();
+      _disposeWarmTerminal();
+      _ensureWarmTerminal();
+    }
   }
 
   Future<void> _saveWindowMaximized(bool isMaximized) async {
@@ -1171,9 +1189,43 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     );
   }
 
+  void _disposeWarmTerminal() {
+    _warmTerminal?.dispose();
+    _warmTerminal = null;
+  }
+
+  Future<void> _enqueueTerminalMutation(Future<void> Function() action) {
+    _terminalMutationQueue = _terminalMutationQueue
+        .then((_) async {
+          if (!mounted) {
+            return;
+          }
+          await action();
+        })
+        .catchError((_) {
+          // Keep the queue alive after failures.
+        });
+    return _terminalMutationQueue;
+  }
+
+  void _setPendingUserTerminalSpawns(int delta) {
+    final next = (_pendingUserTerminalSpawns + delta).clamp(0, 1 << 30).toInt();
+    if (next == _pendingUserTerminalSpawns) {
+      return;
+    }
+    if (!mounted) {
+      _pendingUserTerminalSpawns = next;
+      return;
+    }
+    setState(() {
+      _pendingUserTerminalSpawns = next;
+    });
+  }
+
   TerminalInstance? _startTerminalInstance({
     String? workingDirectory,
     required String failureMessage,
+    bool showFailureMessage = true,
   }) {
     TerminalInstance? instance;
     final shellCandidates = _buildShellLaunchCandidates(defaultShellPath);
@@ -1198,12 +1250,99 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       }
     }
 
-    if (instance == null && mounted) {
+    if (instance == null && mounted && showFailureMessage) {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(failureMessage)));
     }
     return instance;
+  }
+
+  Future<TerminalInstance?> _startTerminalInstanceAsync({
+    String? workingDirectory,
+    required String failureMessage,
+    bool showFailureMessage = true,
+    bool trackBusy = false,
+  }) async {
+    if (trackBusy) {
+      _setPendingUserTerminalSpawns(1);
+      // Yield once so progress UI paints before any native spawn work.
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    try {
+      return _startTerminalInstance(
+        workingDirectory: workingDirectory,
+        failureMessage: failureMessage,
+        showFailureMessage: showFailureMessage,
+      );
+    } finally {
+      if (trackBusy) {
+        _setPendingUserTerminalSpawns(-1);
+      }
+    }
+  }
+
+  void _ensureWarmTerminal() {
+    if (!mounted || _warmingTerminal || _warmTerminal != null) {
+      return;
+    }
+
+    if (_pendingUserTerminalSpawns > 0) {
+      Future<void>.delayed(const Duration(milliseconds: 350), _ensureWarmTerminal);
+      return;
+    }
+
+    _warmingTerminal = true;
+    Future<void>.delayed(const Duration(milliseconds: 200), () async {
+      if (!mounted || _warmTerminal != null) {
+        _warmingTerminal = false;
+        return;
+      }
+
+      final warmed = await _startTerminalInstanceAsync(
+        failureMessage: 'Unable to pre-warm terminal.',
+        showFailureMessage: false,
+      );
+
+      if (!mounted) {
+        warmed?.dispose();
+        _warmingTerminal = false;
+        return;
+      }
+
+      if (_warmTerminal == null) {
+        _warmTerminal = warmed;
+      } else {
+        warmed?.dispose();
+      }
+      _warmingTerminal = false;
+    });
+  }
+
+  Future<TerminalInstance?> _takeOrSpawnTerminalInstance({
+    String? workingDirectory,
+    required String failureMessage,
+    bool trackBusy = false,
+  }) async {
+    if (workingDirectory == null && _warmTerminal != null) {
+      final ready = _warmTerminal!;
+      _warmTerminal = null;
+      _ensureWarmTerminal();
+      return ready;
+    }
+
+    final spawned = await _startTerminalInstanceAsync(
+      workingDirectory: workingDirectory,
+      failureMessage: failureMessage,
+      trackBusy: trackBusy,
+    );
+
+    if (workingDirectory == null) {
+      _ensureWarmTerminal();
+    }
+
+    return spawned;
   }
 
   List<String> _collectPaneIds(PaneNode node) {
@@ -1423,64 +1562,84 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     setState(() {});
   }
 
-  void _addNewTab({String? workingDirectory}) {
-    final instance = _startTerminalInstance(
-      workingDirectory: workingDirectory,
-      failureMessage: 'Unable to start a shell (pwsh/powershell/cmd).',
-    );
-    if (instance == null) {
-      return;
-    }
+  Future<void> _addNewTab({String? workingDirectory}) {
+    return _enqueueTerminalMutation(() async {
+      final instance = await _takeOrSpawnTerminalInstance(
+        workingDirectory: workingDirectory,
+        failureMessage: 'Unable to start a shell (pwsh/powershell/cmd).',
+        trackBusy: true,
+      );
+      if (instance == null) {
+        return;
+      }
 
-    final root = PaneLeafNode(instance.id);
-    final newTab = WorkspaceTab(
-      id: UniqueKey().toString(),
-      title: workingDirectory != null
-          ? workingDirectory.split(Platform.pathSeparator).last
-          : 'Terminal',
-      panes: {instance.id: instance},
-      rootPane: root,
-      focusedPaneId: instance.id,
-    );
+      if (!mounted) {
+        instance.dispose();
+        return;
+      }
 
-    setState(() {
-      tabs.add(newTab);
-      activeTabId = newTab.id;
+      final root = PaneLeafNode(instance.id);
+      final newTab = WorkspaceTab(
+        id: UniqueKey().toString(),
+        title: workingDirectory != null
+            ? workingDirectory.split(Platform.pathSeparator).last
+            : 'Terminal',
+        panes: {instance.id: instance},
+        rootPane: root,
+        focusedPaneId: instance.id,
+      );
+
+      setState(() {
+        tabs.add(newTab);
+        activeTabId = newTab.id;
+      });
     });
   }
 
-  void _splitPane(
+  Future<void> _splitPane(
     WorkspaceTab tab, {
     String? workingDirectory,
     DropSide side = DropSide.right,
     String? targetPaneId,
   }) {
-    final instance = _startTerminalInstance(
-      workingDirectory: workingDirectory,
-      failureMessage: 'Unable to split pane: no shell could be started.',
-    );
-    if (instance == null) {
-      return;
-    }
+    return _enqueueTerminalMutation(() async {
+      if (!mounted || !tabs.contains(tab)) {
+        return;
+      }
 
-    final targetId =
-        targetPaneId ??
-        tab.focusedPaneId ??
-        _collectPaneIds(tab.rootPane).firstOrNull;
-    if (targetId == null) {
-      instance.dispose();
-      return;
-    }
+      final instance = await _takeOrSpawnTerminalInstance(
+        workingDirectory: workingDirectory,
+        failureMessage: 'Unable to split pane: no shell could be started.',
+        trackBusy: true,
+      );
+      if (instance == null) {
+        return;
+      }
 
-    tab.panes[instance.id] = instance;
-    _insertLeafRelativeToTarget(
-      tab,
-      leafToInsert: PaneLeafNode(instance.id),
-      targetPaneId: targetId,
-      side: side,
-    );
-    tab.focusedPaneId = instance.id;
-    setState(() {});
+      if (!mounted || !tabs.contains(tab)) {
+        instance.dispose();
+        return;
+      }
+
+      final targetId =
+          targetPaneId ??
+          tab.focusedPaneId ??
+          _collectPaneIds(tab.rootPane).firstOrNull;
+      if (targetId == null) {
+        instance.dispose();
+        return;
+      }
+
+      tab.panes[instance.id] = instance;
+      _insertLeafRelativeToTarget(
+        tab,
+        leafToInsert: PaneLeafNode(instance.id),
+        targetPaneId: targetId,
+        side: side,
+      );
+      tab.focusedPaneId = instance.id;
+      setState(() {});
+    });
   }
 
   void _closePane(WorkspaceTab tab, String paneId) {
@@ -1520,11 +1679,13 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   }) async {
     final dir = await FilePicker.platform.getDirectoryPath();
     if (dir != null) {
-      _splitPane(
+      unawaited(
+        _splitPane(
         tab,
         workingDirectory: dir,
         side: side,
         targetPaneId: targetPaneId,
+        ),
       );
     }
   }
@@ -1567,7 +1728,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
 
     // Ctrl+T → new tab
     if (ctrl && key == LogicalKeyboardKey.keyT) {
-      _addNewTab();
+      unawaited(_addNewTab());
       return KeyEventResult.handled;
     }
 
@@ -1581,28 +1742,36 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     // Ctrl+D → split pane right (side-by-side)
     if (ctrl && !shift && key == LogicalKeyboardKey.keyD) {
       final tab = _activeTab;
-      if (tab != null) _splitPane(tab, side: DropSide.right);
+      if (tab != null) {
+        unawaited(_splitPane(tab, side: DropSide.right));
+      }
       return KeyEventResult.handled;
     }
 
     // Ctrl+Shift+D → split right with folder picker
     if (ctrl && shift && key == LogicalKeyboardKey.keyD) {
       final tab = _activeTab;
-      if (tab != null) _pickFolderForPane(tab, side: DropSide.right);
+      if (tab != null) {
+        unawaited(_pickFolderForPane(tab, side: DropSide.right));
+      }
       return KeyEventResult.handled;
     }
 
     // Ctrl+E → split pane down (up/down)
     if (ctrl && !shift && key == LogicalKeyboardKey.keyE) {
       final tab = _activeTab;
-      if (tab != null) _splitPane(tab, side: DropSide.bottom);
+      if (tab != null) {
+        unawaited(_splitPane(tab, side: DropSide.bottom));
+      }
       return KeyEventResult.handled;
     }
 
     // Ctrl+Shift+E → split down with folder picker
     if (ctrl && shift && key == LogicalKeyboardKey.keyE) {
       final tab = _activeTab;
-      if (tab != null) _pickFolderForPane(tab, side: DropSide.bottom);
+      if (tab != null) {
+        unawaited(_pickFolderForPane(tab, side: DropSide.bottom));
+      }
       return KeyEventResult.handled;
     }
 
@@ -1615,20 +1784,31 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     final activeTab = _activeTab;
 
     return Scaffold(
-      body: Focus(
-        autofocus: true,
-        focusNode: _keyboardFocusNode,
-        onKeyEvent: _handleKeyEvent,
-        child: Column(
-          children: [
-            _buildTitleBar(),
-            Expanded(
-              child: activeTab == null
-                  ? _buildEmptyState()
-                  : _buildTerminalArea(activeTab),
+      body: Stack(
+        children: [
+          Focus(
+            autofocus: true,
+            focusNode: _keyboardFocusNode,
+            onKeyEvent: _handleKeyEvent,
+            child: Column(
+              children: [
+                _buildTitleBar(),
+                Expanded(
+                  child: activeTab == null
+                      ? _buildEmptyState()
+                      : _buildTerminalArea(activeTab),
+                ),
+              ],
             ),
-          ],
-        ),
+          ),
+          if (_pendingUserTerminalSpawns > 0)
+            const Positioned(
+              top: 40,
+              left: 0,
+              right: 0,
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+        ],
       ),
     );
   }
@@ -1666,7 +1846,9 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
               color: DraculaColors.orange,
               onTap: () {
                 final tab = _activeTab;
-                if (tab != null) _splitPane(tab, side: DropSide.right);
+                if (tab != null) {
+                  unawaited(_splitPane(tab, side: DropSide.right));
+                }
               },
             ),
 
@@ -1678,7 +1860,9 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
               color: DraculaColors.cyan,
               onTap: () {
                 final tab = _activeTab;
-                if (tab != null) _splitPane(tab, side: DropSide.bottom);
+                if (tab != null) {
+                  unawaited(_splitPane(tab, side: DropSide.bottom));
+                }
               },
             ),
 
@@ -1767,10 +1951,12 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             child: Tooltip(
               message: 'New tab · Long-press to pick folder',
               child: GestureDetector(
-                onTap: () => _addNewTab(),
+                onTap: () => unawaited(_addNewTab()),
                 onLongPress: () async {
                   final dir = await FilePicker.platform.getDirectoryPath();
-                  if (dir != null) _addNewTab(workingDirectory: dir);
+                  if (dir != null) {
+                    unawaited(_addNewTab(workingDirectory: dir));
+                  }
                 },
                 child: const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 8),
@@ -2357,21 +2543,29 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       ],
     ).then((value) {
       if (value == 'split_right') {
-        _splitPane(tab, side: DropSide.right, targetPaneId: paneId);
+        unawaited(_splitPane(tab, side: DropSide.right, targetPaneId: paneId));
       } else if (value == 'split_left') {
-        _splitPane(tab, side: DropSide.left, targetPaneId: paneId);
+        unawaited(_splitPane(tab, side: DropSide.left, targetPaneId: paneId));
       } else if (value == 'split_left_folder') {
-        _pickFolderForPane(tab, side: DropSide.left, targetPaneId: paneId);
+        unawaited(
+          _pickFolderForPane(tab, side: DropSide.left, targetPaneId: paneId),
+        );
       } else if (value == 'split_right_folder') {
-        _pickFolderForPane(tab, side: DropSide.right, targetPaneId: paneId);
+        unawaited(
+          _pickFolderForPane(tab, side: DropSide.right, targetPaneId: paneId),
+        );
       } else if (value == 'split_down') {
-        _splitPane(tab, side: DropSide.bottom, targetPaneId: paneId);
+        unawaited(_splitPane(tab, side: DropSide.bottom, targetPaneId: paneId));
       } else if (value == 'split_up') {
-        _splitPane(tab, side: DropSide.top, targetPaneId: paneId);
+        unawaited(_splitPane(tab, side: DropSide.top, targetPaneId: paneId));
       } else if (value == 'split_up_folder') {
-        _pickFolderForPane(tab, side: DropSide.top, targetPaneId: paneId);
+        unawaited(
+          _pickFolderForPane(tab, side: DropSide.top, targetPaneId: paneId),
+        );
       } else if (value == 'split_down_folder') {
-        _pickFolderForPane(tab, side: DropSide.bottom, targetPaneId: paneId);
+        unawaited(
+          _pickFolderForPane(tab, side: DropSide.bottom, targetPaneId: paneId),
+        );
       } else if (value == 'close') {
         _closePane(tab, paneId);
       }
