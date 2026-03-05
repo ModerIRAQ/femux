@@ -20,6 +20,8 @@ const _prefWindowMaximized = 'windowMaximized';
 const _prefLastNotifiedUpdateTag = 'lastNotifiedUpdateTag';
 const _repoOwner = 'ModerIRAQ';
 const _repoName = 'femux';
+const _terminalMaxLines = 3000;
+const _terminalReflowEnabled = false;
 
 class UpdateCheckResult {
   final Version currentVersion;
@@ -40,6 +42,20 @@ class UpdateCheckResult {
 
   bool get updateAvailable => latestVersion > currentVersion;
   bool get hasInstaller => downloadUrl != null;
+}
+
+class _ShellLaunchConfig {
+  final String selectedShell;
+  final String executable;
+  final List<String> arguments;
+
+  const _ShellLaunchConfig({
+    required this.selectedShell,
+    required this.executable,
+    required this.arguments,
+  });
+
+  String get cacheKey => '$executable\u0000${arguments.join('\u0000')}';
 }
 
 bool _isBenignTextInputPlatformException(Object error) {
@@ -99,7 +115,7 @@ void main() async {
   const windowOptions = WindowOptions(
     size: Size(1280, 820),
     center: true,
-    backgroundColor: Colors.transparent,
+    backgroundColor: Color(0xFF282a36),
     skipTaskbar: false,
     titleBarStyle: TitleBarStyle.hidden,
   );
@@ -193,9 +209,14 @@ class TerminalInstance {
   }) : _outputSubscription = outputSubscription;
 
   /// Factory that wires up PTY ↔ Terminal and returns a fully connected instance.
-  factory TerminalInstance.spawn(String shellPath, {String? workingDirectory}) {
-    final executable = _shellExecutable(shellPath);
-    final shellArgs = _shellArguments(shellPath);
+  factory TerminalInstance.spawn(
+    String shellPath, {
+    String? workingDirectory,
+    String? executableOverride,
+    List<String>? argumentsOverride,
+  }) {
+    final executable = executableOverride ?? shellPath;
+    final shellArgs = argumentsOverride ?? _shellArguments(shellPath);
     final shellEnvironment = _shellEnvironment();
 
     final pty = Pty.start(
@@ -205,7 +226,10 @@ class TerminalInstance {
       environment: shellEnvironment,
     );
 
-    final terminal = Terminal(maxLines: 10000);
+    final terminal = Terminal(
+      maxLines: _terminalMaxLines,
+      reflowEnabled: _terminalReflowEnabled,
+    );
 
     final sub = pty.output
         .cast<List<int>>()
@@ -246,21 +270,6 @@ String _shellName(String shellPath) {
   return base.endsWith('.exe') ? base.substring(0, base.length - 4) : base;
 }
 
-String _shellExecutable(String shellPath) {
-  if (!Platform.isWindows) {
-    return shellPath;
-  }
-
-  final name = _shellName(shellPath);
-  if (name == 'pwsh' || name == 'powershell') {
-    // Work around flutter_pty argument parsing quirks on Windows by
-    // launching PowerShell through cmd.
-    return 'cmd.exe';
-  }
-
-  return shellPath;
-}
-
 List<String> _shellArguments(String shellPath) {
   if (!Platform.isWindows) {
     return ['-l'];
@@ -268,11 +277,11 @@ List<String> _shellArguments(String shellPath) {
 
   final name = _shellName(shellPath);
   if (name == 'pwsh') {
-    return ['/D', '/Q', '/K', 'pwsh.exe -NoLogo -NoProfile'];
+    return ['-NoLogo', '-NoProfile'];
   }
 
   if (name == 'powershell') {
-    return ['/D', '/Q', '/K', 'powershell.exe -NoLogo -NoProfile'];
+    return ['-NoLogo', '-NoProfile'];
   }
 
   if (name == 'cmd') {
@@ -326,19 +335,77 @@ String _resolveShellPath(String preferredShell) {
   return normalized;
 }
 
-List<String> _buildShellCandidates(String preferredShell) {
+_ShellLaunchConfig _directShellLaunchConfig(String shellPath) {
+  final args = _shellArguments(shellPath);
+  return _ShellLaunchConfig(
+    selectedShell: shellPath,
+    executable: shellPath,
+    arguments: args,
+  );
+}
+
+_ShellLaunchConfig? _cmdWrappedPowerShellLaunchConfig(String shellPath) {
   if (!Platform.isWindows) {
-    return <String>{_resolveShellPath(preferredShell), 'bash'}.toList();
+    return null;
   }
 
-  // Keep cmd as a guaranteed fallback, with PowerShell variants available
-  // through cmd-based wrappers.
-  return <String>{
+  final name = _shellName(shellPath);
+  if (name == 'pwsh') {
+    return const _ShellLaunchConfig(
+      selectedShell: 'pwsh.exe',
+      executable: 'cmd.exe',
+      arguments: ['/D', '/Q', '/K', 'pwsh.exe -NoLogo -NoProfile'],
+    );
+  }
+
+  if (name == 'powershell') {
+    return const _ShellLaunchConfig(
+      selectedShell: 'powershell.exe',
+      executable: 'cmd.exe',
+      arguments: ['/D', '/Q', '/K', 'powershell.exe -NoLogo -NoProfile'],
+    );
+  }
+
+  return null;
+}
+
+List<_ShellLaunchConfig> _buildShellLaunchCandidates(String preferredShell) {
+  final seen = <String>{};
+  final candidates = <_ShellLaunchConfig>[];
+
+  void addCandidate(_ShellLaunchConfig candidate) {
+    if (seen.add(candidate.cacheKey)) {
+      candidates.add(candidate);
+    }
+  }
+
+  if (!Platform.isWindows) {
+    final preferred = _resolveShellPath(preferredShell);
+    addCandidate(_directShellLaunchConfig(preferred));
+    addCandidate(_directShellLaunchConfig('bash'));
+    return candidates;
+  }
+
+  final shells = <String>[
     _resolveShellPath(preferredShell),
     'cmd.exe',
     'pwsh.exe',
     'powershell.exe',
-  }.toList();
+  ];
+
+  for (final shell in shells) {
+    final wrapped = _cmdWrappedPowerShellLaunchConfig(shell);
+    if (wrapped != null) {
+      addCandidate(wrapped);
+      // flutter_pty on Windows can pass the PowerShell executable name as an
+      // extra script argument when launched directly, producing startup errors.
+      // Keep the cmd wrapper as the stable launch mode for PowerShell variants.
+      continue;
+    }
+    addCandidate(_directShellLaunchConfig(shell));
+  }
+
+  return candidates;
 }
 
 List<String> _settingsShellOptions() {
@@ -451,6 +518,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   bool _startupUpdateCheckTriggered = false;
   String? _dropPreviewPaneId;
   DropSide? _dropPreviewSide;
+  final Set<String> _failedShellLaunches = <String>{};
 
   // For tab rename
   String? _renamingTabId;
@@ -464,7 +532,8 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     _loadCurrentAppVersion();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       _addNewTab();
-      _runStartupUpdateCheck();
+      // Keep startup path focused on terminal responsiveness.
+      Future<void>.delayed(const Duration(seconds: 6), _runStartupUpdateCheck);
     });
   }
 
@@ -1107,17 +1176,24 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     required String failureMessage,
   }) {
     TerminalInstance? instance;
-    final shellCandidates = _buildShellCandidates(defaultShellPath);
+    final shellCandidates = _buildShellLaunchCandidates(defaultShellPath);
 
     for (final shell in shellCandidates) {
+      if (_failedShellLaunches.contains(shell.cacheKey)) {
+        continue;
+      }
       try {
         instance = TerminalInstance.spawn(
-          shell,
+          shell.selectedShell,
           workingDirectory: workingDirectory,
+          executableOverride: shell.executable,
+          argumentsOverride: shell.arguments,
         );
-        defaultShellPath = shell;
+        _failedShellLaunches.remove(shell.cacheKey);
+        defaultShellPath = shell.selectedShell;
         break;
       } catch (_) {
+        _failedShellLaunches.add(shell.cacheKey);
         continue;
       }
     }
@@ -1455,7 +1531,13 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
 
   WorkspaceTab? get _activeTab {
     if (activeTabId == null) return null;
-    return tabs.where((t) => t.id == activeTabId).firstOrNull;
+    final id = activeTabId;
+    for (final tab in tabs) {
+      if (tab.id == id) {
+        return tab;
+      }
+    }
+    return null;
   }
 
   void _startRenameTab(WorkspaceTab tab) {
@@ -1861,7 +1943,6 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     }
 
     final split = node as PaneSplitNode;
-    _syncSplitTree(split);
     return MultiSplitView(
       axis: split.axis,
       controller: split.controller,
