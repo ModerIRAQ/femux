@@ -2200,8 +2200,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
           tab.focusedPaneId = paneId;
         });
       },
-      onSecondaryTapUp: (details) {
-        _showPaneContextMenu(context, details.globalPosition, tab, paneId);
+      onSecondaryTapDown: (details) {
+        unawaited(
+          _showPaneContextMenu(context, details.globalPosition, tab, paneId),
+        );
       },
       child: DragTarget<String>(
         onWillAcceptWithDetails: (details) => details.data != paneId,
@@ -2383,13 +2385,19 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   }
 
   // --- Pane right-click context menu ---
-  void _showPaneContextMenu(
+  Future<void> _showPaneContextMenu(
     BuildContext context,
     Offset position,
     WorkspaceTab tab,
     String paneId,
-  ) {
-    showMenu<String>(
+  ) async {
+    // Yield one microtask so pointer handling can complete before route push.
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted || !context.mounted || !tabs.contains(tab)) {
+      return;
+    }
+
+    final value = await showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
         position.dx,
@@ -2398,6 +2406,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
         position.dy,
       ),
       color: DraculaColors.currentLine,
+      popUpAnimationStyle: AnimationStyle.noAnimation,
       items: [
         const PopupMenuItem(
           value: 'split_right',
@@ -2541,34 +2550,44 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             ),
           ),
       ],
-    ).then((value) {
-      if (value == 'split_right') {
-        unawaited(_splitPane(tab, side: DropSide.right, targetPaneId: paneId));
-      } else if (value == 'split_left') {
-        unawaited(_splitPane(tab, side: DropSide.left, targetPaneId: paneId));
-      } else if (value == 'split_left_folder') {
-        unawaited(
-          _pickFolderForPane(tab, side: DropSide.left, targetPaneId: paneId),
-        );
-      } else if (value == 'split_right_folder') {
-        unawaited(
-          _pickFolderForPane(tab, side: DropSide.right, targetPaneId: paneId),
-        );
-      } else if (value == 'split_down') {
-        unawaited(_splitPane(tab, side: DropSide.bottom, targetPaneId: paneId));
-      } else if (value == 'split_up') {
-        unawaited(_splitPane(tab, side: DropSide.top, targetPaneId: paneId));
-      } else if (value == 'split_up_folder') {
-        unawaited(
-          _pickFolderForPane(tab, side: DropSide.top, targetPaneId: paneId),
-        );
-      } else if (value == 'split_down_folder') {
-        unawaited(
-          _pickFolderForPane(tab, side: DropSide.bottom, targetPaneId: paneId),
-        );
-      } else if (value == 'close') {
-        _closePane(tab, paneId);
-      }
-    });
+    );
+
+    if (!mounted || !tabs.contains(tab) || value == null) {
+      return;
+    }
+
+    // Let the popup route removal paint before terminal spawn work begins.
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || !tabs.contains(tab)) {
+      return;
+    }
+
+    if (value == 'split_right') {
+      unawaited(_splitPane(tab, side: DropSide.right, targetPaneId: paneId));
+    } else if (value == 'split_left') {
+      unawaited(_splitPane(tab, side: DropSide.left, targetPaneId: paneId));
+    } else if (value == 'split_left_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.left, targetPaneId: paneId),
+      );
+    } else if (value == 'split_right_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.right, targetPaneId: paneId),
+      );
+    } else if (value == 'split_down') {
+      unawaited(_splitPane(tab, side: DropSide.bottom, targetPaneId: paneId));
+    } else if (value == 'split_up') {
+      unawaited(_splitPane(tab, side: DropSide.top, targetPaneId: paneId));
+    } else if (value == 'split_up_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.top, targetPaneId: paneId),
+      );
+    } else if (value == 'split_down_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.bottom, targetPaneId: paneId),
+      );
+    } else if (value == 'close') {
+      _closePane(tab, paneId);
+    }
   }
 }
