@@ -20,6 +20,8 @@ const _prefWindowMaximized = 'windowMaximized';
 const _prefLastNotifiedUpdateTag = 'lastNotifiedUpdateTag';
 const _repoOwner = 'ModerIRAQ';
 const _repoName = 'femux';
+const _terminalMaxLines = 3000;
+const _terminalReflowEnabled = false;
 
 class UpdateCheckResult {
   final Version currentVersion;
@@ -40,6 +42,20 @@ class UpdateCheckResult {
 
   bool get updateAvailable => latestVersion > currentVersion;
   bool get hasInstaller => downloadUrl != null;
+}
+
+class _ShellLaunchConfig {
+  final String selectedShell;
+  final String executable;
+  final List<String> arguments;
+
+  const _ShellLaunchConfig({
+    required this.selectedShell,
+    required this.executable,
+    required this.arguments,
+  });
+
+  String get cacheKey => '$executable\u0000${arguments.join('\u0000')}';
 }
 
 bool _isBenignTextInputPlatformException(Object error) {
@@ -99,7 +115,7 @@ void main() async {
   const windowOptions = WindowOptions(
     size: Size(1280, 820),
     center: true,
-    backgroundColor: Colors.transparent,
+    backgroundColor: Color(0xFF282a36),
     skipTaskbar: false,
     titleBarStyle: TitleBarStyle.hidden,
   );
@@ -193,10 +209,15 @@ class TerminalInstance {
   }) : _outputSubscription = outputSubscription;
 
   /// Factory that wires up PTY ↔ Terminal and returns a fully connected instance.
-  factory TerminalInstance.spawn(String shellPath, {String? workingDirectory}) {
-    final executable = _shellExecutable(shellPath);
-    final shellArgs = _shellArguments(shellPath);
-    final shellEnvironment = _shellEnvironment(shellPath);
+  factory TerminalInstance.spawn(
+    String shellPath, {
+    String? workingDirectory,
+    String? executableOverride,
+    List<String>? argumentsOverride,
+  }) {
+    final executable = executableOverride ?? shellPath;
+    final shellArgs = argumentsOverride ?? _shellArguments(shellPath);
+    final shellEnvironment = _shellEnvironment();
 
     final pty = Pty.start(
       executable,
@@ -205,7 +226,10 @@ class TerminalInstance {
       environment: shellEnvironment,
     );
 
-    final terminal = Terminal(maxLines: 10000);
+    final terminal = Terminal(
+      maxLines: _terminalMaxLines,
+      reflowEnabled: _terminalReflowEnabled,
+    );
 
     final sub = pty.output
         .cast<List<int>>()
@@ -246,21 +270,6 @@ String _shellName(String shellPath) {
   return base.endsWith('.exe') ? base.substring(0, base.length - 4) : base;
 }
 
-String _shellExecutable(String shellPath) {
-  if (!Platform.isWindows) {
-    return shellPath;
-  }
-
-  final name = _shellName(shellPath);
-  if (name == 'pwsh' || name == 'powershell') {
-    // Work around flutter_pty argument parsing quirks on Windows by
-    // launching PowerShell through cmd.
-    return 'cmd.exe';
-  }
-
-  return shellPath;
-}
-
 List<String> _shellArguments(String shellPath) {
   if (!Platform.isWindows) {
     return ['-l'];
@@ -268,11 +277,11 @@ List<String> _shellArguments(String shellPath) {
 
   final name = _shellName(shellPath);
   if (name == 'pwsh') {
-    return ['/D', '/Q', '/K', 'pwsh.exe -NoLogo -NoProfile'];
+    return ['-NoLogo', '-NoProfile'];
   }
 
   if (name == 'powershell') {
-    return ['/D', '/Q', '/K', 'powershell.exe -NoLogo -NoProfile'];
+    return ['-NoLogo', '-NoProfile'];
   }
 
   if (name == 'cmd') {
@@ -282,50 +291,28 @@ List<String> _shellArguments(String shellPath) {
   return [];
 }
 
-Map<String, String>? _shellEnvironment(String shellPath) {
+Map<String, String>? _shellEnvironment() {
   if (!Platform.isWindows) {
     return null;
   }
 
-  final env = Platform.environment;
-  final result = <String, String>{};
-
-  const keys = [
-    'PATH',
-    'USERPROFILE',
-    'HOMEDRIVE',
-    'HOMEPATH',
-    'HOME',
-    'APPDATA',
-    'LOCALAPPDATA',
-    'TEMP',
-    'TMP',
-    'SystemRoot',
-    'WINDIR',
-    'COMSPEC',
-    'PATHEXT',
-    'PSModulePath',
-    'ProgramFiles',
-    'ProgramFiles(x86)',
-    'ProgramW6432',
-    'PUBLIC',
-    'USERNAME',
-    'USERDOMAIN',
-  ];
-
-  for (final key in keys) {
-    final value = env[key];
-    if (value != null && value.isNotEmpty) {
-      result[key] = value;
-    }
-  }
+  // Keep the full inherited environment so tools such as ssh can access
+  // auth-agent/proxy variables that may not exist in a small allow-list.
+  final result = Map<String, String>.from(Platform.environment);
 
   // PowerShell relies on a valid user home when initializing FileSystem drives.
-  result['HOME'] = result['HOME'] ?? result['USERPROFILE'] ?? '';
-
-  // Do not pass an empty HOME.
-  if (result['HOME']!.isEmpty) {
+  final home = result['HOME']?.trim() ?? '';
+  final userProfile = result['USERPROFILE']?.trim() ?? '';
+  if (home.isEmpty && userProfile.isNotEmpty) {
+    result['HOME'] = userProfile;
+  } else if (home.isEmpty) {
     result.remove('HOME');
+  }
+
+  // Ensure interactive CLI apps (including ssh remote shells) receive a usable TERM.
+  final term = result['TERM']?.trim() ?? '';
+  if (term.isEmpty) {
+    result['TERM'] = 'xterm-256color';
   }
 
   return result;
@@ -348,19 +335,77 @@ String _resolveShellPath(String preferredShell) {
   return normalized;
 }
 
-List<String> _buildShellCandidates(String preferredShell) {
+_ShellLaunchConfig _directShellLaunchConfig(String shellPath) {
+  final args = _shellArguments(shellPath);
+  return _ShellLaunchConfig(
+    selectedShell: shellPath,
+    executable: shellPath,
+    arguments: args,
+  );
+}
+
+_ShellLaunchConfig? _cmdWrappedPowerShellLaunchConfig(String shellPath) {
   if (!Platform.isWindows) {
-    return <String>{_resolveShellPath(preferredShell), 'bash'}.toList();
+    return null;
   }
 
-  // Keep cmd as a guaranteed fallback, with PowerShell variants available
-  // through cmd-based wrappers.
-  return <String>{
+  final name = _shellName(shellPath);
+  if (name == 'pwsh') {
+    return const _ShellLaunchConfig(
+      selectedShell: 'pwsh.exe',
+      executable: 'cmd.exe',
+      arguments: ['/D', '/Q', '/K', 'pwsh.exe -NoLogo -NoProfile'],
+    );
+  }
+
+  if (name == 'powershell') {
+    return const _ShellLaunchConfig(
+      selectedShell: 'powershell.exe',
+      executable: 'cmd.exe',
+      arguments: ['/D', '/Q', '/K', 'powershell.exe -NoLogo -NoProfile'],
+    );
+  }
+
+  return null;
+}
+
+List<_ShellLaunchConfig> _buildShellLaunchCandidates(String preferredShell) {
+  final seen = <String>{};
+  final candidates = <_ShellLaunchConfig>[];
+
+  void addCandidate(_ShellLaunchConfig candidate) {
+    if (seen.add(candidate.cacheKey)) {
+      candidates.add(candidate);
+    }
+  }
+
+  if (!Platform.isWindows) {
+    final preferred = _resolveShellPath(preferredShell);
+    addCandidate(_directShellLaunchConfig(preferred));
+    addCandidate(_directShellLaunchConfig('bash'));
+    return candidates;
+  }
+
+  final shells = <String>[
     _resolveShellPath(preferredShell),
     'cmd.exe',
     'pwsh.exe',
     'powershell.exe',
-  }.toList();
+  ];
+
+  for (final shell in shells) {
+    final wrapped = _cmdWrappedPowerShellLaunchConfig(shell);
+    if (wrapped != null) {
+      addCandidate(wrapped);
+      // flutter_pty on Windows can pass the PowerShell executable name as an
+      // extra script argument when launched directly, producing startup errors.
+      // Keep the cmd wrapper as the stable launch mode for PowerShell variants.
+      continue;
+    }
+    addCandidate(_directShellLaunchConfig(shell));
+  }
+
+  return candidates;
 }
 
 List<String> _settingsShellOptions() {
@@ -473,6 +518,11 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   bool _startupUpdateCheckTriggered = false;
   String? _dropPreviewPaneId;
   DropSide? _dropPreviewSide;
+  final Set<String> _failedShellLaunches = <String>{};
+  Future<void> _terminalMutationQueue = Future<void>.value();
+  int _pendingUserTerminalSpawns = 0;
+  TerminalInstance? _warmTerminal;
+  bool _warmingTerminal = false;
 
   // For tab rename
   String? _renamingTabId;
@@ -485,8 +535,9 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     _loadSettings();
     _loadCurrentAppVersion();
     WidgetsBinding.instance.addPostFrameCallback((_) {
-      _addNewTab();
-      _runStartupUpdateCheck();
+      unawaited(_addNewTab());
+      // Keep startup path focused on terminal responsiveness.
+      Future<void>.delayed(const Duration(seconds: 6), _runStartupUpdateCheck);
     });
   }
 
@@ -495,6 +546,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     windowManager.removeListener(this);
     _keyboardFocusNode.dispose();
     _renameController.dispose();
+    _disposeWarmTerminal();
     for (final tab in tabs) {
       tab.dispose();
     }
@@ -540,6 +592,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     if (!options.contains(resolved)) {
       resolved = fallback;
     }
+    final shellChanged = resolved != defaultShellPath;
 
     if (savedShell != null && savedShell.isNotEmpty) {
       setState(() {
@@ -551,15 +604,27 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
         defaultShellPath = resolved;
       });
     }
+
+    if (shellChanged) {
+      _failedShellLaunches.clear();
+      _disposeWarmTerminal();
+      _ensureWarmTerminal();
+    }
   }
 
   Future<void> _saveDefaultShell(String shell) async {
+    final shellChanged = shell != defaultShellPath;
     final prefs = await SharedPreferences.getInstance();
     await prefs.setString(_prefDefaultShell, shell);
     if (!mounted) return;
     setState(() {
       defaultShellPath = shell;
     });
+    if (shellChanged) {
+      _failedShellLaunches.clear();
+      _disposeWarmTerminal();
+      _ensureWarmTerminal();
+    }
   }
 
   Future<void> _saveWindowMaximized(bool isMaximized) async {
@@ -1124,32 +1189,160 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     );
   }
 
+  void _disposeWarmTerminal() {
+    _warmTerminal?.dispose();
+    _warmTerminal = null;
+  }
+
+  Future<void> _enqueueTerminalMutation(Future<void> Function() action) {
+    _terminalMutationQueue = _terminalMutationQueue
+        .then((_) async {
+          if (!mounted) {
+            return;
+          }
+          await action();
+        })
+        .catchError((_) {
+          // Keep the queue alive after failures.
+        });
+    return _terminalMutationQueue;
+  }
+
+  void _setPendingUserTerminalSpawns(int delta) {
+    final next = (_pendingUserTerminalSpawns + delta).clamp(0, 1 << 30).toInt();
+    if (next == _pendingUserTerminalSpawns) {
+      return;
+    }
+    if (!mounted) {
+      _pendingUserTerminalSpawns = next;
+      return;
+    }
+    setState(() {
+      _pendingUserTerminalSpawns = next;
+    });
+  }
+
   TerminalInstance? _startTerminalInstance({
     String? workingDirectory,
     required String failureMessage,
+    bool showFailureMessage = true,
   }) {
     TerminalInstance? instance;
-    final shellCandidates = _buildShellCandidates(defaultShellPath);
+    final shellCandidates = _buildShellLaunchCandidates(defaultShellPath);
 
     for (final shell in shellCandidates) {
+      if (_failedShellLaunches.contains(shell.cacheKey)) {
+        continue;
+      }
       try {
         instance = TerminalInstance.spawn(
-          shell,
+          shell.selectedShell,
           workingDirectory: workingDirectory,
+          executableOverride: shell.executable,
+          argumentsOverride: shell.arguments,
         );
-        defaultShellPath = shell;
+        _failedShellLaunches.remove(shell.cacheKey);
+        defaultShellPath = shell.selectedShell;
         break;
       } catch (_) {
+        _failedShellLaunches.add(shell.cacheKey);
         continue;
       }
     }
 
-    if (instance == null && mounted) {
+    if (instance == null && mounted && showFailureMessage) {
       ScaffoldMessenger.of(
         context,
       ).showSnackBar(SnackBar(content: Text(failureMessage)));
     }
     return instance;
+  }
+
+  Future<TerminalInstance?> _startTerminalInstanceAsync({
+    String? workingDirectory,
+    required String failureMessage,
+    bool showFailureMessage = true,
+    bool trackBusy = false,
+  }) async {
+    if (trackBusy) {
+      _setPendingUserTerminalSpawns(1);
+      // Yield once so progress UI paints before any native spawn work.
+      await Future<void>.delayed(Duration.zero);
+    }
+
+    try {
+      return _startTerminalInstance(
+        workingDirectory: workingDirectory,
+        failureMessage: failureMessage,
+        showFailureMessage: showFailureMessage,
+      );
+    } finally {
+      if (trackBusy) {
+        _setPendingUserTerminalSpawns(-1);
+      }
+    }
+  }
+
+  void _ensureWarmTerminal() {
+    if (!mounted || _warmingTerminal || _warmTerminal != null) {
+      return;
+    }
+
+    if (_pendingUserTerminalSpawns > 0) {
+      Future<void>.delayed(const Duration(milliseconds: 350), _ensureWarmTerminal);
+      return;
+    }
+
+    _warmingTerminal = true;
+    Future<void>.delayed(const Duration(milliseconds: 200), () async {
+      if (!mounted || _warmTerminal != null) {
+        _warmingTerminal = false;
+        return;
+      }
+
+      final warmed = await _startTerminalInstanceAsync(
+        failureMessage: 'Unable to pre-warm terminal.',
+        showFailureMessage: false,
+      );
+
+      if (!mounted) {
+        warmed?.dispose();
+        _warmingTerminal = false;
+        return;
+      }
+
+      if (_warmTerminal == null) {
+        _warmTerminal = warmed;
+      } else {
+        warmed?.dispose();
+      }
+      _warmingTerminal = false;
+    });
+  }
+
+  Future<TerminalInstance?> _takeOrSpawnTerminalInstance({
+    String? workingDirectory,
+    required String failureMessage,
+    bool trackBusy = false,
+  }) async {
+    if (workingDirectory == null && _warmTerminal != null) {
+      final ready = _warmTerminal!;
+      _warmTerminal = null;
+      _ensureWarmTerminal();
+      return ready;
+    }
+
+    final spawned = await _startTerminalInstanceAsync(
+      workingDirectory: workingDirectory,
+      failureMessage: failureMessage,
+      trackBusy: trackBusy,
+    );
+
+    if (workingDirectory == null) {
+      _ensureWarmTerminal();
+    }
+
+    return spawned;
   }
 
   List<String> _collectPaneIds(PaneNode node) {
@@ -1369,64 +1562,84 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     setState(() {});
   }
 
-  void _addNewTab({String? workingDirectory}) {
-    final instance = _startTerminalInstance(
-      workingDirectory: workingDirectory,
-      failureMessage: 'Unable to start a shell (pwsh/powershell/cmd).',
-    );
-    if (instance == null) {
-      return;
-    }
+  Future<void> _addNewTab({String? workingDirectory}) {
+    return _enqueueTerminalMutation(() async {
+      final instance = await _takeOrSpawnTerminalInstance(
+        workingDirectory: workingDirectory,
+        failureMessage: 'Unable to start a shell (pwsh/powershell/cmd).',
+        trackBusy: true,
+      );
+      if (instance == null) {
+        return;
+      }
 
-    final root = PaneLeafNode(instance.id);
-    final newTab = WorkspaceTab(
-      id: UniqueKey().toString(),
-      title: workingDirectory != null
-          ? workingDirectory.split(Platform.pathSeparator).last
-          : 'Terminal',
-      panes: {instance.id: instance},
-      rootPane: root,
-      focusedPaneId: instance.id,
-    );
+      if (!mounted) {
+        instance.dispose();
+        return;
+      }
 
-    setState(() {
-      tabs.add(newTab);
-      activeTabId = newTab.id;
+      final root = PaneLeafNode(instance.id);
+      final newTab = WorkspaceTab(
+        id: UniqueKey().toString(),
+        title: workingDirectory != null
+            ? workingDirectory.split(Platform.pathSeparator).last
+            : 'Terminal',
+        panes: {instance.id: instance},
+        rootPane: root,
+        focusedPaneId: instance.id,
+      );
+
+      setState(() {
+        tabs.add(newTab);
+        activeTabId = newTab.id;
+      });
     });
   }
 
-  void _splitPane(
+  Future<void> _splitPane(
     WorkspaceTab tab, {
     String? workingDirectory,
     DropSide side = DropSide.right,
     String? targetPaneId,
   }) {
-    final instance = _startTerminalInstance(
-      workingDirectory: workingDirectory,
-      failureMessage: 'Unable to split pane: no shell could be started.',
-    );
-    if (instance == null) {
-      return;
-    }
+    return _enqueueTerminalMutation(() async {
+      if (!mounted || !tabs.contains(tab)) {
+        return;
+      }
 
-    final targetId =
-        targetPaneId ??
-        tab.focusedPaneId ??
-        _collectPaneIds(tab.rootPane).firstOrNull;
-    if (targetId == null) {
-      instance.dispose();
-      return;
-    }
+      final instance = await _takeOrSpawnTerminalInstance(
+        workingDirectory: workingDirectory,
+        failureMessage: 'Unable to split pane: no shell could be started.',
+        trackBusy: true,
+      );
+      if (instance == null) {
+        return;
+      }
 
-    tab.panes[instance.id] = instance;
-    _insertLeafRelativeToTarget(
-      tab,
-      leafToInsert: PaneLeafNode(instance.id),
-      targetPaneId: targetId,
-      side: side,
-    );
-    tab.focusedPaneId = instance.id;
-    setState(() {});
+      if (!mounted || !tabs.contains(tab)) {
+        instance.dispose();
+        return;
+      }
+
+      final targetId =
+          targetPaneId ??
+          tab.focusedPaneId ??
+          _collectPaneIds(tab.rootPane).firstOrNull;
+      if (targetId == null) {
+        instance.dispose();
+        return;
+      }
+
+      tab.panes[instance.id] = instance;
+      _insertLeafRelativeToTarget(
+        tab,
+        leafToInsert: PaneLeafNode(instance.id),
+        targetPaneId: targetId,
+        side: side,
+      );
+      tab.focusedPaneId = instance.id;
+      setState(() {});
+    });
   }
 
   void _closePane(WorkspaceTab tab, String paneId) {
@@ -1466,18 +1679,26 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   }) async {
     final dir = await FilePicker.platform.getDirectoryPath();
     if (dir != null) {
-      _splitPane(
+      unawaited(
+        _splitPane(
         tab,
         workingDirectory: dir,
         side: side,
         targetPaneId: targetPaneId,
+        ),
       );
     }
   }
 
   WorkspaceTab? get _activeTab {
     if (activeTabId == null) return null;
-    return tabs.where((t) => t.id == activeTabId).firstOrNull;
+    final id = activeTabId;
+    for (final tab in tabs) {
+      if (tab.id == id) {
+        return tab;
+      }
+    }
+    return null;
   }
 
   void _startRenameTab(WorkspaceTab tab) {
@@ -1507,7 +1728,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
 
     // Ctrl+T → new tab
     if (ctrl && key == LogicalKeyboardKey.keyT) {
-      _addNewTab();
+      unawaited(_addNewTab());
       return KeyEventResult.handled;
     }
 
@@ -1521,28 +1742,36 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     // Ctrl+D → split pane right (side-by-side)
     if (ctrl && !shift && key == LogicalKeyboardKey.keyD) {
       final tab = _activeTab;
-      if (tab != null) _splitPane(tab, side: DropSide.right);
+      if (tab != null) {
+        unawaited(_splitPane(tab, side: DropSide.right));
+      }
       return KeyEventResult.handled;
     }
 
     // Ctrl+Shift+D → split right with folder picker
     if (ctrl && shift && key == LogicalKeyboardKey.keyD) {
       final tab = _activeTab;
-      if (tab != null) _pickFolderForPane(tab, side: DropSide.right);
+      if (tab != null) {
+        unawaited(_pickFolderForPane(tab, side: DropSide.right));
+      }
       return KeyEventResult.handled;
     }
 
     // Ctrl+E → split pane down (up/down)
     if (ctrl && !shift && key == LogicalKeyboardKey.keyE) {
       final tab = _activeTab;
-      if (tab != null) _splitPane(tab, side: DropSide.bottom);
+      if (tab != null) {
+        unawaited(_splitPane(tab, side: DropSide.bottom));
+      }
       return KeyEventResult.handled;
     }
 
     // Ctrl+Shift+E → split down with folder picker
     if (ctrl && shift && key == LogicalKeyboardKey.keyE) {
       final tab = _activeTab;
-      if (tab != null) _pickFolderForPane(tab, side: DropSide.bottom);
+      if (tab != null) {
+        unawaited(_pickFolderForPane(tab, side: DropSide.bottom));
+      }
       return KeyEventResult.handled;
     }
 
@@ -1555,20 +1784,31 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     final activeTab = _activeTab;
 
     return Scaffold(
-      body: Focus(
-        autofocus: true,
-        focusNode: _keyboardFocusNode,
-        onKeyEvent: _handleKeyEvent,
-        child: Column(
-          children: [
-            _buildTitleBar(),
-            Expanded(
-              child: activeTab == null
-                  ? _buildEmptyState()
-                  : _buildTerminalArea(activeTab),
+      body: Stack(
+        children: [
+          Focus(
+            autofocus: true,
+            focusNode: _keyboardFocusNode,
+            onKeyEvent: _handleKeyEvent,
+            child: Column(
+              children: [
+                _buildTitleBar(),
+                Expanded(
+                  child: activeTab == null
+                      ? _buildEmptyState()
+                      : _buildTerminalArea(activeTab),
+                ),
+              ],
             ),
-          ],
-        ),
+          ),
+          if (_pendingUserTerminalSpawns > 0)
+            const Positioned(
+              top: 40,
+              left: 0,
+              right: 0,
+              child: LinearProgressIndicator(minHeight: 2),
+            ),
+        ],
       ),
     );
   }
@@ -1606,7 +1846,9 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
               color: DraculaColors.orange,
               onTap: () {
                 final tab = _activeTab;
-                if (tab != null) _splitPane(tab, side: DropSide.right);
+                if (tab != null) {
+                  unawaited(_splitPane(tab, side: DropSide.right));
+                }
               },
             ),
 
@@ -1618,7 +1860,9 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
               color: DraculaColors.cyan,
               onTap: () {
                 final tab = _activeTab;
-                if (tab != null) _splitPane(tab, side: DropSide.bottom);
+                if (tab != null) {
+                  unawaited(_splitPane(tab, side: DropSide.bottom));
+                }
               },
             ),
 
@@ -1707,10 +1951,12 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             child: Tooltip(
               message: 'New tab · Long-press to pick folder',
               child: GestureDetector(
-                onTap: () => _addNewTab(),
+                onTap: () => unawaited(_addNewTab()),
                 onLongPress: () async {
                   final dir = await FilePicker.platform.getDirectoryPath();
-                  if (dir != null) _addNewTab(workingDirectory: dir);
+                  if (dir != null) {
+                    unawaited(_addNewTab(workingDirectory: dir));
+                  }
                 },
                 child: const Padding(
                   padding: EdgeInsets.symmetric(horizontal: 8),
@@ -1883,7 +2129,6 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     }
 
     final split = node as PaneSplitNode;
-    _syncSplitTree(split);
     return MultiSplitView(
       axis: split.axis,
       controller: split.controller,
@@ -1949,16 +2194,24 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     final paneId = instance.id;
     final isFocused = tab.focusedPaneId == paneId;
 
-    return GestureDetector(
-      onTap: () {
+    return Listener(
+      behavior: HitTestBehavior.translucent,
+      onPointerDown: (_) {
+        if (tab.focusedPaneId == paneId) {
+          return;
+        }
         setState(() {
           tab.focusedPaneId = paneId;
         });
       },
-      onSecondaryTapUp: (details) {
-        _showPaneContextMenu(context, details.globalPosition, tab, paneId);
-      },
-      child: DragTarget<String>(
+      child: GestureDetector(
+        behavior: HitTestBehavior.translucent,
+        onSecondaryTapDown: (details) {
+          unawaited(
+            _showPaneContextMenu(context, details.globalPosition, tab, paneId),
+          );
+        },
+        child: DragTarget<String>(
         onWillAcceptWithDetails: (details) => details.data != paneId,
         onMove: (details) {
           final side = _resolveDropSide(context, details.offset);
@@ -2136,18 +2389,25 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             ),
           );
         },
+        ),
       ),
     );
   }
 
   // --- Pane right-click context menu ---
-  void _showPaneContextMenu(
+  Future<void> _showPaneContextMenu(
     BuildContext context,
     Offset position,
     WorkspaceTab tab,
     String paneId,
-  ) {
-    showMenu<String>(
+  ) async {
+    // Yield one microtask so pointer handling can complete before route push.
+    await Future<void>.delayed(Duration.zero);
+    if (!mounted || !context.mounted || !tabs.contains(tab)) {
+      return;
+    }
+
+    final value = await showMenu<String>(
       context: context,
       position: RelativeRect.fromLTRB(
         position.dx,
@@ -2156,6 +2416,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
         position.dy,
       ),
       color: DraculaColors.currentLine,
+      popUpAnimationStyle: AnimationStyle.noAnimation,
       items: [
         const PopupMenuItem(
           value: 'split_right',
@@ -2299,26 +2560,44 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
             ),
           ),
       ],
-    ).then((value) {
-      if (value == 'split_right') {
-        _splitPane(tab, side: DropSide.right, targetPaneId: paneId);
-      } else if (value == 'split_left') {
-        _splitPane(tab, side: DropSide.left, targetPaneId: paneId);
-      } else if (value == 'split_left_folder') {
-        _pickFolderForPane(tab, side: DropSide.left, targetPaneId: paneId);
-      } else if (value == 'split_right_folder') {
-        _pickFolderForPane(tab, side: DropSide.right, targetPaneId: paneId);
-      } else if (value == 'split_down') {
-        _splitPane(tab, side: DropSide.bottom, targetPaneId: paneId);
-      } else if (value == 'split_up') {
-        _splitPane(tab, side: DropSide.top, targetPaneId: paneId);
-      } else if (value == 'split_up_folder') {
-        _pickFolderForPane(tab, side: DropSide.top, targetPaneId: paneId);
-      } else if (value == 'split_down_folder') {
-        _pickFolderForPane(tab, side: DropSide.bottom, targetPaneId: paneId);
-      } else if (value == 'close') {
-        _closePane(tab, paneId);
-      }
-    });
+    );
+
+    if (!mounted || !tabs.contains(tab) || value == null) {
+      return;
+    }
+
+    // Let the popup route removal paint before terminal spawn work begins.
+    await WidgetsBinding.instance.endOfFrame;
+    if (!mounted || !tabs.contains(tab)) {
+      return;
+    }
+
+    if (value == 'split_right') {
+      unawaited(_splitPane(tab, side: DropSide.right, targetPaneId: paneId));
+    } else if (value == 'split_left') {
+      unawaited(_splitPane(tab, side: DropSide.left, targetPaneId: paneId));
+    } else if (value == 'split_left_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.left, targetPaneId: paneId),
+      );
+    } else if (value == 'split_right_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.right, targetPaneId: paneId),
+      );
+    } else if (value == 'split_down') {
+      unawaited(_splitPane(tab, side: DropSide.bottom, targetPaneId: paneId));
+    } else if (value == 'split_up') {
+      unawaited(_splitPane(tab, side: DropSide.top, targetPaneId: paneId));
+    } else if (value == 'split_up_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.top, targetPaneId: paneId),
+      );
+    } else if (value == 'split_down_folder') {
+      unawaited(
+        _pickFolderForPane(tab, side: DropSide.bottom, targetPaneId: paneId),
+      );
+    } else if (value == 'close') {
+      _closePane(tab, paneId);
+    }
   }
 }
