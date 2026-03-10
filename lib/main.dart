@@ -2020,7 +2020,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                           child: TerminalView(
                             key: ValueKey(instance.id),
                             instance.terminal,
-                            backgroundOpacity: 0.0,
+                            // Keep the terminal renderer opaque so ANSI clear
+                            // sequences repaint the full surface instead of
+                            // leaving stale pixels in the retained layer.
+                            backgroundOpacity: 1.0,
                             theme: terminalTheme,
                             hardwareKeyboardOnly:
                                 Platform.isWindows ||
