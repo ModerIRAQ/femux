@@ -507,6 +507,7 @@ class MainWorkspace extends StatefulWidget {
 
 class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   final FocusNode _keyboardFocusNode = FocusNode();
+  final Map<String, FocusNode> _terminalFocusNodes = <String, FocusNode>{};
 
   final List<WorkspaceTab> tabs = [];
   String? activeTabId;
@@ -545,6 +546,9 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
   void dispose() {
     windowManager.removeListener(this);
     _keyboardFocusNode.dispose();
+    for (final node in _terminalFocusNodes.values) {
+      node.dispose();
+    }
     _renameController.dispose();
     _disposeWarmTerminal();
     for (final tab in tabs) {
@@ -578,7 +582,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     FocusManager.instance.primaryFocus?.unfocus();
     // Restore keyboard focus after the transition settles.
     Future.delayed(const Duration(milliseconds: 150), () {
-      if (mounted) _keyboardFocusNode.requestFocus();
+      if (!mounted) {
+        return;
+      }
+      _focusActivePane();
     });
   }
 
@@ -1289,7 +1296,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     }
 
     if (_pendingUserTerminalSpawns > 0) {
-      Future<void>.delayed(const Duration(milliseconds: 350), _ensureWarmTerminal);
+      Future<void>.delayed(
+        const Duration(milliseconds: 350),
+        _ensureWarmTerminal,
+      );
       return;
     }
 
@@ -1593,6 +1603,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
         tabs.add(newTab);
         activeTabId = newTab.id;
       });
+      _focusPaneSoon(instance.id);
     });
   }
 
@@ -1639,6 +1650,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       );
       tab.focusedPaneId = instance.id;
       setState(() {});
+      _focusPaneSoon(instance.id);
     });
   }
 
@@ -1655,14 +1667,19 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
 
     final instance = tab.panes.remove(paneId);
     instance?.dispose();
+    _disposeFocusNodeForPane(paneId);
 
     if (tab.focusedPaneId == paneId) {
       tab.focusedPaneId = _collectPaneIds(tab.rootPane).firstOrNull;
     }
     setState(() {});
+    _focusActivePane();
   }
 
   void _closeTab(WorkspaceTab tab) {
+    for (final paneId in tab.panes.keys) {
+      _disposeFocusNodeForPane(paneId);
+    }
     tab.dispose();
     setState(() {
       tabs.remove(tab);
@@ -1670,6 +1687,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
         activeTabId = tabs.isNotEmpty ? tabs.last.id : null;
       }
     });
+    _focusActivePane();
   }
 
   Future<void> _pickFolderForPane(
@@ -1681,10 +1699,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     if (dir != null) {
       unawaited(
         _splitPane(
-        tab,
-        workingDirectory: dir,
-        side: side,
-        targetPaneId: targetPaneId,
+          tab,
+          workingDirectory: dir,
+          side: side,
+          targetPaneId: targetPaneId,
         ),
       );
     }
@@ -1699,6 +1717,40 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       }
     }
     return null;
+  }
+
+  FocusNode _focusNodeForPane(String paneId) {
+    return _terminalFocusNodes.putIfAbsent(
+      paneId,
+      () => FocusNode(debugLabel: 'terminal:$paneId'),
+    );
+  }
+
+  void _disposeFocusNodeForPane(String paneId) {
+    _terminalFocusNodes.remove(paneId)?.dispose();
+  }
+
+  void _focusPaneSoon(String paneId) {
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (!mounted) {
+        return;
+      }
+      final node = _terminalFocusNodes[paneId];
+      if (node == null || !node.canRequestFocus) {
+        _keyboardFocusNode.requestFocus();
+        return;
+      }
+      node.requestFocus();
+    });
+  }
+
+  void _focusActivePane() {
+    final paneId = _activeTab?.focusedPaneId;
+    if (paneId == null) {
+      _keyboardFocusNode.requestFocus();
+      return;
+    }
+    _focusPaneSoon(paneId);
   }
 
   void _startRenameTab(WorkspaceTab tab) {
@@ -1975,7 +2027,10 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
           key: ValueKey(tab.id),
           index: index,
           child: GestureDetector(
-            onTap: () => setState(() => activeTabId = tab.id),
+            onTap: () {
+              setState(() => activeTabId = tab.id);
+              _focusActivePane();
+            },
             onDoubleTap: () => _startRenameTab(tab),
             child: Container(
               padding: const EdgeInsets.symmetric(horizontal: 14),
@@ -2197,12 +2252,15 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     return Listener(
       behavior: HitTestBehavior.translucent,
       onPointerDown: (_) {
-        if (tab.focusedPaneId == paneId) {
+        if (tab.focusedPaneId == paneId && tab.id == activeTabId) {
+          _focusPaneSoon(paneId);
           return;
         }
         setState(() {
+          activeTabId = tab.id;
           tab.focusedPaneId = paneId;
         });
+        _focusPaneSoon(paneId);
       },
       child: GestureDetector(
         behavior: HitTestBehavior.translucent,
@@ -2212,183 +2270,187 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
           );
         },
         child: DragTarget<String>(
-        onWillAcceptWithDetails: (details) => details.data != paneId,
-        onMove: (details) {
-          final side = _resolveDropSide(context, details.offset);
-          if (_dropPreviewPaneId == paneId && _dropPreviewSide == side) {
-            return;
-          }
-          setState(() {
-            _dropPreviewPaneId = paneId;
-            _dropPreviewSide = side;
-          });
-        },
-        onLeave: (_) {
-          if (_dropPreviewPaneId != paneId) {
-            return;
-          }
-          setState(() {
-            _dropPreviewPaneId = null;
-            _dropPreviewSide = null;
-          });
-        },
-        onAcceptWithDetails: (details) {
-          final side = _resolveDropSide(context, details.offset);
-          setState(() {
-            _dropPreviewPaneId = null;
-            _dropPreviewSide = null;
-          });
-          _movePaneByDrop(
-            tab,
-            draggedPaneId: details.data,
-            targetPaneId: paneId,
-            side: side,
-          );
-        },
-        builder: (context, candidateData, rejectedData) {
-          final hasCandidate = candidateData.isNotEmpty;
-          final showPreview =
-              _dropPreviewPaneId == paneId && _dropPreviewSide != null;
+          onWillAcceptWithDetails: (details) => details.data != paneId,
+          onMove: (details) {
+            final side = _resolveDropSide(context, details.offset);
+            if (_dropPreviewPaneId == paneId && _dropPreviewSide == side) {
+              return;
+            }
+            setState(() {
+              _dropPreviewPaneId = paneId;
+              _dropPreviewSide = side;
+            });
+          },
+          onLeave: (_) {
+            if (_dropPreviewPaneId != paneId) {
+              return;
+            }
+            setState(() {
+              _dropPreviewPaneId = null;
+              _dropPreviewSide = null;
+            });
+          },
+          onAcceptWithDetails: (details) {
+            final side = _resolveDropSide(context, details.offset);
+            setState(() {
+              _dropPreviewPaneId = null;
+              _dropPreviewSide = null;
+            });
+            _movePaneByDrop(
+              tab,
+              draggedPaneId: details.data,
+              targetPaneId: paneId,
+              side: side,
+            );
+          },
+          builder: (context, candidateData, rejectedData) {
+            final hasCandidate = candidateData.isNotEmpty;
+            final showPreview =
+                _dropPreviewPaneId == paneId && _dropPreviewSide != null;
 
-          return Container(
-            clipBehavior: Clip.hardEdge,
-            decoration: BoxDecoration(
-              border: Border.all(
-                color: isFocused
-                    ? DraculaColors.purple.withValues(alpha: 0.6)
-                    : DraculaColors.currentLine.withValues(alpha: 0.3),
-                width: isFocused ? 1.5 : 1,
+            return Container(
+              clipBehavior: Clip.hardEdge,
+              decoration: BoxDecoration(
+                border: Border.all(
+                  color: isFocused
+                      ? DraculaColors.purple.withValues(alpha: 0.6)
+                      : DraculaColors.currentLine.withValues(alpha: 0.3),
+                  width: isFocused ? 1.5 : 1,
+                ),
               ),
-            ),
-            child: Stack(
-              children: [
-                Positioned.fill(
-                  top: 28,
-                  child: Container(
-                    color: DraculaColors.background,
-                    child: ClipRect(
-                      child: Padding(
-                        padding: const EdgeInsets.only(top: 1),
-                        child: RepaintBoundary(
-                          child: TerminalView(
-                            key: ValueKey(instance.id),
-                            instance.terminal,
-                            // Keep the terminal renderer opaque so ANSI clear
-                            // sequences repaint the full surface instead of
-                            // leaving stale pixels in the retained layer.
-                            backgroundOpacity: 1.0,
-                            theme: terminalTheme,
-                            hardwareKeyboardOnly:
-                                Platform.isWindows ||
-                                Platform.isLinux ||
-                                Platform.isMacOS,
+              child: Stack(
+                children: [
+                  Positioned.fill(
+                    top: 28,
+                    child: Container(
+                      color: DraculaColors.background,
+                      child: ClipRect(
+                        child: Padding(
+                          padding: const EdgeInsets.only(top: 1),
+                          child: RepaintBoundary(
+                            child: TerminalView(
+                              key: ValueKey('terminal-view-$paneId'),
+                              instance.terminal,
+                              // Keep the terminal renderer opaque so ANSI clear
+                              // sequences repaint the full surface instead of
+                              // leaving stale pixels in the retained layer.
+                              backgroundOpacity: 1.0,
+                              focusNode: _focusNodeForPane(paneId),
+                              autofocus: isFocused && tab.id == activeTabId,
+                              theme: terminalTheme,
+                              hardwareKeyboardOnly:
+                                  Platform.isWindows ||
+                                  Platform.isLinux ||
+                                  Platform.isMacOS,
+                            ),
                           ),
                         ),
                       ),
                     ),
                   ),
-                ),
-                Container(
-                  height: 28,
-                  padding: const EdgeInsets.symmetric(horizontal: 6),
-                  decoration: BoxDecoration(
-                    color: hasCandidate
-                        ? DraculaColors.purple.withValues(alpha: 0.25)
-                        : DraculaColors.currentLine,
-                    border: Border(
-                      bottom: BorderSide(
-                        color: DraculaColors.currentLine.withValues(alpha: 0.5),
+                  Container(
+                    height: 28,
+                    padding: const EdgeInsets.symmetric(horizontal: 6),
+                    decoration: BoxDecoration(
+                      color: hasCandidate
+                          ? DraculaColors.purple.withValues(alpha: 0.25)
+                          : DraculaColors.currentLine,
+                      border: Border(
+                        bottom: BorderSide(
+                          color: DraculaColors.currentLine.withValues(
+                            alpha: 0.5,
+                          ),
+                        ),
                       ),
                     ),
-                  ),
-                  child: Row(
-                    children: [
-                      Draggable<String>(
-                        data: paneId,
-                        dragAnchorStrategy: childDragAnchorStrategy,
-                        maxSimultaneousDrags: 1,
-                        onDragEnd: (_) {
-                          if (_dropPreviewPaneId == null &&
-                              _dropPreviewSide == null) {
-                            return;
-                          }
-                          setState(() {
-                            _dropPreviewPaneId = null;
-                            _dropPreviewSide = null;
-                          });
-                        },
-                        feedback: Material(
-                          color: Colors.transparent,
-                          child: Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 8,
-                              vertical: 4,
-                            ),
-                            decoration: BoxDecoration(
-                              color: DraculaColors.currentLine,
-                              border: Border.all(color: DraculaColors.purple),
-                              borderRadius: BorderRadius.circular(4),
-                            ),
-                            child: Text(
-                              'Pane $paneNo',
-                              style: const TextStyle(
-                                color: DraculaColors.foreground,
-                                fontSize: 11,
+                    child: Row(
+                      children: [
+                        Draggable<String>(
+                          data: paneId,
+                          dragAnchorStrategy: childDragAnchorStrategy,
+                          maxSimultaneousDrags: 1,
+                          onDragEnd: (_) {
+                            if (_dropPreviewPaneId == null &&
+                                _dropPreviewSide == null) {
+                              return;
+                            }
+                            setState(() {
+                              _dropPreviewPaneId = null;
+                              _dropPreviewSide = null;
+                            });
+                          },
+                          feedback: Material(
+                            color: Colors.transparent,
+                            child: Container(
+                              padding: const EdgeInsets.symmetric(
+                                horizontal: 8,
+                                vertical: 4,
+                              ),
+                              decoration: BoxDecoration(
+                                color: DraculaColors.currentLine,
+                                border: Border.all(color: DraculaColors.purple),
+                                borderRadius: BorderRadius.circular(4),
+                              ),
+                              child: Text(
+                                'Pane $paneNo',
+                                style: const TextStyle(
+                                  color: DraculaColors.foreground,
+                                  fontSize: 11,
+                                ),
                               ),
                             ),
                           ),
-                        ),
-                        childWhenDragging: const Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 4),
-                          child: Icon(
-                            Icons.drag_indicator,
-                            size: 14,
-                            color: DraculaColors.purple,
+                          childWhenDragging: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 4),
+                            child: Icon(
+                              Icons.drag_indicator,
+                              size: 14,
+                              color: DraculaColors.purple,
+                            ),
+                          ),
+                          child: const Padding(
+                            padding: EdgeInsets.symmetric(horizontal: 4),
+                            child: Icon(
+                              Icons.drag_indicator,
+                              size: 14,
+                              color: DraculaColors.comment,
+                            ),
                           ),
                         ),
-                        child: const Padding(
-                          padding: EdgeInsets.symmetric(horizontal: 4),
-                          child: Icon(
-                            Icons.drag_indicator,
-                            size: 14,
-                            color: DraculaColors.comment,
+                        Expanded(
+                          child: Text(
+                            'Pane $paneNo',
+                            style: TextStyle(
+                              color: isFocused
+                                  ? DraculaColors.foreground
+                                  : DraculaColors.comment,
+                              fontSize: 11,
+                              fontWeight: isFocused
+                                  ? FontWeight.w600
+                                  : FontWeight.w400,
+                            ),
                           ),
                         ),
-                      ),
-                      Expanded(
-                        child: Text(
-                          'Pane $paneNo',
-                          style: TextStyle(
-                            color: isFocused
-                                ? DraculaColors.foreground
-                                : DraculaColors.comment,
-                            fontSize: 11,
-                            fontWeight: isFocused
-                                ? FontWeight.w600
-                                : FontWeight.w400,
+                        InkWell(
+                          onTap: () => _closePane(tab, paneId),
+                          borderRadius: BorderRadius.circular(4),
+                          child: const Padding(
+                            padding: EdgeInsets.all(3),
+                            child: Icon(
+                              Icons.close,
+                              size: 12,
+                              color: DraculaColors.comment,
+                            ),
                           ),
                         ),
-                      ),
-                      InkWell(
-                        onTap: () => _closePane(tab, paneId),
-                        borderRadius: BorderRadius.circular(4),
-                        child: const Padding(
-                          padding: EdgeInsets.all(3),
-                          child: Icon(
-                            Icons.close,
-                            size: 12,
-                            color: DraculaColors.comment,
-                          ),
-                        ),
-                      ),
-                    ],
+                      ],
+                    ),
                   ),
-                ),
-                if (showPreview) _buildDropSideOverlay(_dropPreviewSide!),
-              ],
-            ),
-          );
-        },
+                  if (showPreview) _buildDropSideOverlay(_dropPreviewSide!),
+                ],
+              ),
+            );
+          },
         ),
       ),
     );
