@@ -485,6 +485,15 @@ class PaneSplitNode extends PaneNode {
 
 enum DropSide { left, right, top, bottom }
 
+enum GridLayout {
+  grid2x2,
+  grid3x3,
+  grid1x3,
+  grid3x1,
+  grid2x3,
+  grid3x2,
+}
+
 class _PaneLocation {
   final PaneLeafNode leaf;
   final PaneSplitNode? parent;
@@ -1110,6 +1119,7 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                   _helpRow('Ctrl+Shift+D', 'Split right and choose a folder'),
                   _helpRow('Ctrl+E', 'Split active pane down (up/down)'),
                   _helpRow('Ctrl+Shift+E', 'Split down and choose a folder'),
+                  _helpRow('Ctrl+G', 'Split into grid (dialog)'),
                   const SizedBox(height: 14),
                   const Text(
                     'Mouse tricks',
@@ -1654,6 +1664,245 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
     });
   }
 
+  // --- Split pane into a grid (multiple panes at once) ---
+  Future<void> _splitPaneMultiple(
+    WorkspaceTab tab, {
+    required GridLayout layout,
+    String? workingDirectory,
+    String? targetPaneId,
+  }) {
+    return _enqueueTerminalMutation(() async {
+      if (!mounted || !tabs.contains(tab)) return;
+
+      final targetId =
+          targetPaneId ??
+          tab.focusedPaneId ??
+          _collectPaneIds(tab.rootPane).firstOrNull;
+      if (targetId == null) return;
+
+      // Determine grid dimensions.
+      late final int rows, cols;
+      switch (layout) {
+        case GridLayout.grid2x2:
+          rows = 2; cols = 2;
+        case GridLayout.grid3x3:
+          rows = 3; cols = 3;
+        case GridLayout.grid1x3:
+          rows = 1; cols = 3;
+        case GridLayout.grid3x1:
+          rows = 3; cols = 1;
+        case GridLayout.grid2x3:
+          rows = 2; cols = 3;
+        case GridLayout.grid3x2:
+          rows = 3; cols = 2;
+      }
+
+      final newPanesNeeded = rows * cols - 1;
+
+      // Yield once so dialog can close before heavy work.
+      await Future<void>.delayed(Duration.zero);
+
+      // Spawn all terminals by reusing the warm terminal when possible
+      // and doing direct synchronous spawn for the rest.
+      final newInstances = <TerminalInstance>[];
+
+      for (var i = 0; i < newPanesNeeded; i++) {
+        if (!mounted || !tabs.contains(tab)) {
+          for (final inst in newInstances) {
+            inst.dispose();
+          }
+          return;
+        }
+        TerminalInstance? instance;
+        if (workingDirectory == null && _warmTerminal != null) {
+          instance = _warmTerminal;
+          _warmTerminal = null;
+          _ensureWarmTerminal();
+        } else {
+          instance = _startTerminalInstance(
+            workingDirectory: workingDirectory,
+            failureMessage: 'Unable to split pane: no shell could be started.',
+          );
+          if (workingDirectory == null) _ensureWarmTerminal();
+        }
+        if (instance == null) {
+          for (final inst in newInstances) {
+            inst.dispose();
+          }
+          return;
+        }
+        newInstances.add(instance);
+      }
+
+      if (!mounted || !tabs.contains(tab)) {
+        for (final inst in newInstances) {
+          inst.dispose();
+        }
+        return;
+      }
+
+      for (final inst in newInstances) {
+        tab.panes[inst.id] = inst;
+      }
+
+      // Build flat multi-child tree: columns first, then join horizontally.
+      // Row-major order: target is [0], new panes fill the rest.
+      final allLeafIds = <String>[targetId, ...newInstances.map((e) => e.id)];
+      var idx = 0;
+
+      final columnNodes = <PaneNode>[];
+      for (var c = 0; c < cols; c++) {
+        final colLeaves = <PaneLeafNode>[];
+        for (var r = 0; r < rows; r++) {
+          colLeaves.add(PaneLeafNode(allLeafIds[idx++]));
+        }
+        if (colLeaves.length == 1) {
+          columnNodes.add(colLeaves.single);
+        } else {
+          columnNodes.add(PaneSplitNode(
+            axis: Axis.vertical,
+            children: colLeaves,
+          ));
+        }
+      }
+
+      final root = columnNodes.length == 1
+          ? columnNodes.single
+          : PaneSplitNode(
+              axis: Axis.horizontal,
+              children: columnNodes,
+            );
+
+      _replacePaneNode(tab, targetId, root);
+      tab.rootPane = _normalizePaneTree(tab.rootPane);
+
+      tab.focusedPaneId = newInstances.first.id;
+      setState(() {});
+      _focusPaneSoon(newInstances.first.id);
+    });
+  }
+
+  // --- Open a dialog to choose a grid layout for splitting ---
+  Future<void> _openSplitGridDialog() async {
+    final tab = _activeTab;
+    if (tab == null) return;
+
+    final result = await showDialog<GridLayout>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          backgroundColor: DraculaColors.background,
+          title: const Text(
+            'Split into Grid',
+            style: TextStyle(color: DraculaColors.foreground),
+          ),
+          contentPadding:
+              const EdgeInsets.symmetric(horizontal: 20, vertical: 16),
+          actionsPadding: const EdgeInsets.only(right: 12, bottom: 12),
+          content: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              _buildGridDialogTile(
+                dialogContext,
+                icon: Icons.grid_3x3,
+                label: '2 \u00d7 2',
+                subtitle: 'Split into four panes',
+                layout: GridLayout.grid2x2,
+              ),
+              _buildGridDialogTile(
+                dialogContext,
+                icon: Icons.grid_on,
+                label: '3 \u00d7 3',
+                subtitle: 'Split into nine panes',
+                layout: GridLayout.grid3x3,
+              ),
+              _buildGridDialogTile(
+                dialogContext,
+                icon: Icons.view_column,
+                label: '1 \u00d7 3',
+                subtitle: 'Three panes side-by-side',
+                layout: GridLayout.grid1x3,
+              ),
+              _buildGridDialogTile(
+                dialogContext,
+                icon: Icons.view_list,
+                label: '3 \u00d7 1',
+                subtitle: 'Three panes stacked',
+                layout: GridLayout.grid3x1,
+              ),
+              _buildGridDialogTile(
+                dialogContext,
+                icon: Icons.dashboard_customize,
+                label: '2 \u00d7 3',
+                subtitle: '2 rows, 3 columns',
+                layout: GridLayout.grid2x3,
+              ),
+              _buildGridDialogTile(
+                dialogContext,
+                icon: Icons.dashboard_customize,
+                label: '3 \u00d7 2',
+                subtitle: '3 rows, 2 columns',
+                layout: GridLayout.grid3x2,
+                isLast: true,
+              ),
+            ],
+          ),
+        );
+      },
+    );
+
+    if (result != null) {
+      unawaited(_splitPaneMultiple(tab, layout: result));
+    }
+  }
+
+  Widget _buildGridDialogTile(
+    BuildContext dialogContext, {
+    required IconData icon,
+    required String label,
+    required String subtitle,
+    required GridLayout layout,
+    bool isLast = false,
+  }) {
+    return InkWell(
+      onTap: () => Navigator.pop(dialogContext, layout),
+      child: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: 8,
+          vertical: isLast ? 4 : 8,
+        ),
+        child: Row(
+          children: [
+            Icon(icon, size: 22, color: DraculaColors.cyan),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      color: DraculaColors.foreground,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w500,
+                    ),
+                  ),
+                  Text(
+                    subtitle,
+                    style: const TextStyle(
+                      color: DraculaColors.comment,
+                      fontSize: 12,
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+
   void _closePane(WorkspaceTab tab, String paneId) {
     if (tab.paneCount <= 1) {
       _closeTab(tab);
@@ -1827,6 +2076,12 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       return KeyEventResult.handled;
     }
 
+    // Ctrl+G → open split grid dialog
+    if (ctrl && !shift && key == LogicalKeyboardKey.keyG) {
+      unawaited(_openSplitGridDialog());
+      return KeyEventResult.handled;
+    }
+
     return KeyEventResult.ignored;
   }
 
@@ -1916,6 +2171,14 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
                   unawaited(_splitPane(tab, side: DropSide.bottom));
                 }
               },
+            ),
+
+            // Split into grid
+            _titleBarIconButton(
+              icon: Icons.grid_on,
+              tooltip: 'Split into grid (Ctrl+G)',
+              color: DraculaColors.green,
+              onTap: () => unawaited(_openSplitGridDialog()),
             ),
 
             _titleBarIconButton(
@@ -2621,6 +2884,22 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
               ],
             ),
           ),
+        const PopupMenuItem(
+          value: 'split_grid',
+          child: Row(
+            children: [
+              Icon(Icons.grid_on, size: 16, color: DraculaColors.cyan),
+              SizedBox(width: 8),
+              Text(
+                'Split into grid\u2026',
+                style: TextStyle(
+                  color: DraculaColors.foreground,
+                  fontSize: 13,
+                ),
+              ),
+            ],
+          ),
+        ),
       ],
     );
 
@@ -2660,6 +2939,8 @@ class _MainWorkspaceState extends State<MainWorkspace> with WindowListener {
       );
     } else if (value == 'close') {
       _closePane(tab, paneId);
+    } else if (value == 'split_grid') {
+      unawaited(_openSplitGridDialog());
     }
   }
 }
